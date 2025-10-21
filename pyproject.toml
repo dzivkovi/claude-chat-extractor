@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-chat-extractor"
+version = "1.0.0"
+description = "Extract and consolidate shared Claude conversations"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "playwright>=1.40.0",
+]
+
+[project.scripts]
+claude-chat-extractor = "claude_chat_extractor.extractor:main"
+
+[project.urls]
+Homepage = "https://github.com/dzivkovi/claude-chat-extractor"
+Repository = "https://github.com/dzivkovi/claude-chat-extractor"
+Issues = "https://github.com/dzivkovi/claude-chat-extractor/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
