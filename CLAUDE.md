@@ -11,7 +11,10 @@ Claude Chat Extractor is a Python CLI tool that extracts conversations from Clau
 ## Installation & Setup
 
 ```bash
-# Install package
+# Install from GitHub
+pip install git+https://github.com/dzivkovi/claude-chat-extractor.git
+
+# Or install locally (if you've cloned the repo)
 pip install .
 
 # Install Playwright browser (required)
