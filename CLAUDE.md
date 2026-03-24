@@ -11,14 +11,16 @@ Claude Chat Extractor is a Python CLI tool that extracts conversations from Clau
 ## Installation & Setup
 
 ```bash
-# Install from GitHub
+# Install globally (available from any directory)
 pip install git+https://github.com/dzivkovi/claude-chat-extractor.git
+patchright install chromium
 
-# Or install locally (if you've cloned the repo)
-pip install .
+# Or for development (editable mode)
+pip install -e .
+patchright install chromium
 
-# Install Playwright browser (required)
-playwright install chromium
+# Update to latest
+pip install --upgrade git+https://github.com/dzivkovi/claude-chat-extractor.git
 ```
 
 ## Running the Tool
@@ -110,8 +112,10 @@ claude-chat-extractor CHAT_URL --keep-artifacts --keep-html
 
 ## Key Dependencies
 
-- **playwright>=1.40.0**: Browser automation for fetching chat content
-- Requires manual Chromium installation via `playwright install chromium`
+- **patchright>=1.50.0**: Patched Playwright fork that bypasses Cloudflare bot detection
+- Falls back to `playwright` if patchright is not installed
+- Requires Chrome installed on the system (uses `channel="chrome"`)
+- Browser profile persisted at `~/.claude-chat-extractor/browser_profile/`
 
 ## Output Files
 
@@ -129,6 +133,9 @@ claude-chat-extractor CHAT_URL --keep-artifacts --keep-html
 ## Important Behavioral Notes
 
 - Browser runs in non-headless mode to allow CAPTCHA handling
+- Uses persistent browser context to preserve Cloudflare `cf_clearance` cookies across runs
+- With Patchright, uses real Chrome instead of bundled Chromium to avoid bot fingerprinting
+- Auto-detects Cloudflare challenge pages and waits for resolution
 - User must press Enter after CAPTCHA/page load confirmation
 - URL validation warns if URL doesn't match `https://claude.ai/share/` pattern
 - Message extraction filters out elements with <10 characters
