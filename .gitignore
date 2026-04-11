@@ -43,4 +43,6 @@ consolidated_chat.md
 
 # Playwright
 .playwright/
+.playwright-mcp/
+
 .claude/settings.local.json

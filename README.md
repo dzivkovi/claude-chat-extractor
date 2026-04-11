@@ -26,7 +26,7 @@ claude-chat-extractor https://claude.ai/share/CHAT_ID
 
 Your 200k token conversation becomes ~50k tokens (75% reduction) while preserving all content and code artifacts.
 
-**Note:** This tool extracts from Claude shared chat URLs and is designed for continuing conversations in Claude Desktop.
+**Note:** This tool extracts from Claude shared chat URLs and is designed for continuing conversations in Claude Desktop. Gemini share URLs (`gemini.google.com/share/...`) are also supported — see [Gemini support](#gemini-support-experimental) below.
 
 ## Why Patchright? (Cloudflare Bot Detection)
 
@@ -63,13 +63,49 @@ pip install git+https://github.com/dzivkovi/claude-chat-extractor.git
 patchright install chromium
 ```
 
-This installs the `claude-chat-extractor` command globally in your Python environment. You can run it from any directory.
+This installs the `claude-chat-extractor` command globally in your Python environment. You can run it from any directory — the current working directory does not matter.
 
-To **update** to the latest version:
+### Check which version you have
+
+```bash
+claude-chat-extractor --version
+```
+
+Prints the installed version and description, for example:
+
+```text
+claude-chat-extractor 1.2.0
+Extract and consolidate shared Claude and Gemini conversations
+```
+
+This is the fastest way to confirm an upgrade landed, or to report what you're running when filing a bug.
+
+### Updating to the latest version
+
+When new commits are pushed to `main`, rerun the install with the `--upgrade` flag — pip will re-fetch the repo from GitHub and replace your existing installation in place:
 
 ```bash
 pip install --upgrade git+https://github.com/dzivkovi/claude-chat-extractor.git
 ```
+
+Then verify the new version:
+
+```bash
+claude-chat-extractor --version
+```
+
+Without `--upgrade`, pip sees the package is "already installed" and does nothing, so the flag is load-bearing — it's what makes the command re-install instead of skip.
+
+### Pinning to a specific release
+
+If you want to lock to an exact version (for reproducibility, or to roll back after a bad release), append `@<tag>` to the install URL:
+
+```bash
+# Install exactly v1.2.0 regardless of what's on main
+pip install git+https://github.com/dzivkovi/claude-chat-extractor.git@v1.2.0
+```
+
+Tag names come from the project's git tags; see `git tag -l` in the repo or the [GitHub releases page](https://github.com/dzivkovi/claude-chat-extractor/tags).
 
 ### Development Install
 
@@ -115,6 +151,22 @@ python -m claude_chat_extractor https://claude.ai/share/CHAT_ID
 claude-chat-extractor CHAT_URL --keep-artifacts --keep-html
 ```
 
+## Gemini support (experimental)
+
+In addition to Claude, the tool can extract shared Gemini conversations from `https://gemini.google.com/share/...` URLs. The provider is auto-detected from the URL hostname — no extra flag required:
+
+```bash
+# Auto-detected as Gemini from the hostname
+claude-chat-extractor https://gemini.google.com/share/ee483c76e7a5
+
+# Or force a provider explicitly
+claude-chat-extractor --provider gemini https://gemini.google.com/share/ee483c76e7a5
+```
+
+The output format is identical for both providers — the assistant's role label in the markdown reflects which AI answered (`🤖 **Claude**` vs `🤖 **Gemini**`).
+
+**Why "experimental":** Gemini's share pages are Angular-based with custom elements (`<share-turn-viewer>`, `<user-query-content>`, `<message-content>`) and no public selector contract. Google may rev the DOM in future builds and silently break extraction. If a Gemini run returns 0 messages, file an issue — the fix is a selector update in the `PROVIDERS` registry in [src/claude_chat_extractor/extractor.py](src/claude_chat_extractor/extractor.py). Code-block (`<pre><code>`) extraction for Gemini conversations is also unverified; if your conversation contains code artifacts that don't appear in the output, please report it.
+
 ## How to Continue a Conversation
 
 1. **Share your chat** - Click share button in Claude Desktop
@@ -142,15 +194,18 @@ Format optimized for LLM consumption. No intermediate folders created by default
 
 ```text
 positional:
-  url                   Claude share URL
+  url                      Share URL (Claude or Gemini)
 
 optional:
-  -o, --output PATH     Output file path (default: consolidated_chat.md)
-  -f, --format FORMAT   markdown (default) or pdf
-  -w, --work-dir PATH   Working directory for intermediate files
-                         (only created when needed)
-  --keep-artifacts      Save individual artifact files to work dir
-  --keep-html           Save intermediate HTML to work dir
+  -V, --version            Print installed version and description, then exit
+  -o, --output PATH        Output file path (default: consolidated_chat.md)
+  -f, --format FORMAT      markdown (default) or pdf
+  -w, --work-dir PATH      Working directory for intermediate files
+                           (only created when needed)
+  --keep-artifacts         Save individual artifact files to work dir
+  --keep-html              Save intermediate HTML to work dir
+  --provider {claude,gemini}
+                           AI provider (auto-detected from URL hostname)
 ```
 
 ## Requirements

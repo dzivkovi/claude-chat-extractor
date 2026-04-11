@@ -1,6 +1,15 @@
-"""Claude Chat Extractor - Extract and consolidate shared Claude conversations."""
+"""Extract and consolidate shared Claude and Gemini conversations."""
 
-from .extractor import fetch_chat, consolidate_markdown
+from .extractor import (
+    PROVIDERS,
+    __version__,
+    consolidate_markdown,
+    fetch_chat,
+)
 
-__version__ = "1.1.0"
-__all__ = ["fetch_chat", "consolidate_markdown"]
+__all__ = [
+    "PROVIDERS",
+    "__version__",
+    "consolidate_markdown",
+    "fetch_chat",
+]

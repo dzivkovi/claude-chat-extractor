@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Claude Chat Extractor is a Python CLI tool that extracts conversations from Claude shared chat URLs using Playwright browser automation. It consolidates the conversation and code artifacts into a single markdown file, optimized for LLM consumption with ~75% token reduction.
+Claude Chat Extractor is a Python CLI tool that extracts conversations from shared chat URLs using Playwright browser automation. It consolidates the conversation and code artifacts into a single markdown file, optimized for LLM consumption with ~75% token reduction.
+
+Primary target is Claude (`https://claude.ai/share/...`). As of v1.2.0 it also supports Gemini (`https://gemini.google.com/share/...`) via a second provider entry — see the `PROVIDERS` registry in [extractor.py](src/claude_chat_extractor/extractor.py).
 
 **Key Use Case**: Continue Claude Desktop conversations beyond the 200k token limit by extracting chat history to markdown and uploading to a new session.
 
@@ -55,20 +57,34 @@ src/claude_chat_extractor/
 
 ### Core Components ([extractor.py](src/claude_chat_extractor/extractor.py))
 
-**`fetch_chat(url, work_dir, format_type, keep_html)`** ([extractor.py:23-175](src/claude_chat_extractor/extractor.py#L23-L175))
-- Launches headless=False Chromium browser via Playwright
-- Navigates to Claude share URL with manual CAPTCHA handling
-- Waits for user input to confirm page load
-- Extracts conversation messages via JavaScript evaluation
-- Extracts code artifacts from `<pre><code>` blocks
-- Saves intermediate files: `conversation.json`, `conversation.md`, `artifact_code_*.{ext}`, optionally `chat_complete.html`
-- Returns metadata dict with artifact count and work directory
+**`PROVIDERS` registry** — module-level dict mapping provider key (`'claude'`, `'gemini'`) to a config with `url_prefix`, `extract_messages` callable, and display `label`. This is the extension point for new providers: add one entry with the right URL prefix and a `_extract_messages_<provider>` function.
 
-**Key Implementation Details**:
-- Message extraction uses `[data-test-render-count]` selector
-- Role detection checks for `.user` class or `.font-user-message` selector
-- Scrolls to bottom before extraction to load lazy content
-- PDF generation uses Playwright's `page.pdf()` method
+**`fetch_chat(url, format_type, work_dir, keep_html, provider='claude')`**
+
+- Launches headless=False Chrome via Patchright (falls back to Playwright)
+- Navigates to the share URL with manual CAPTCHA handling
+- Waits for user input to confirm page load
+- Dispatches to `PROVIDERS[provider]['extract_messages']` for message extraction
+- Extracts code artifacts from `<pre><code>` blocks (shared across providers; unverified for Gemini)
+- Saves intermediate files: `conversation.json`, `artifact_code_*.{ext}`, optionally `chat_complete.html`
+- Returns metadata dict with message count, artifact count, and optionally `pdf_path`
+
+**Provider-specific extraction shapes** — *structurally different, not just different selectors*:
+
+- **Claude** (`_extract_messages_claude`): iterates a flat list of `[data-test-render-count]` containers and detects role per element via `.font-user-message` / `className.includes('user')`.
+- **Gemini** (`_extract_messages_gemini`): iterates `<share-turn-viewer>` custom elements, each containing one `<user-query-content>` (user side) and one `<response-container> message-content` (model side). Strips the leading `"You said"` accessibility-label prefix from `user-query-content.innerText`.
+
+**`consolidate_markdown(url, messages, artifacts, output_file, assistant_label='Claude')`**
+
+- Builds a single markdown file with metadata header, artifact TOC, conversation text with role labels (`👤 User` / `🤖 {assistant_label}`), and embedded artifact code blocks
+- Default cleanup: removes individual artifact files unless `--keep-artifacts`
+
+**`main()`**
+
+- CLI entry point with argparse; adds `--provider {claude,gemini}` flag
+- Auto-detects provider from URL hostname when `--provider` is omitted (falls back to `claude` if no prefix matches)
+- URL validation uses the selected provider's `url_prefix` — warns but does not block
+- Orchestrates: fetch → consolidate (for markdown) or fetch → move PDF
 
 **`consolidate_markdown(work_dir, output_file, keep_artifacts)`** ([extractor.py:178-287](src/claude_chat_extractor/extractor.py#L178-L287))
 - Reads `conversation.md` and all `artifact_code_*.*` files

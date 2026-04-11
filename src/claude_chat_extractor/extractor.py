@@ -23,6 +23,21 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 
+# Single source of truth: pyproject.toml. importlib.metadata reads the
+# installed package's metadata (populated by setuptools at build/install
+# time). Fallback covers running extractor.py directly without install.
+try:
+    from importlib.metadata import PackageNotFoundError, metadata as _pkg_metadata
+
+    _pkg_meta = _pkg_metadata("claude-chat-extractor")
+    __version__ = _pkg_meta["Version"]
+    __description__ = _pkg_meta["Summary"]
+except (ImportError, PackageNotFoundError):
+    __version__ = "1.2.0"
+    __description__ = (
+        "Extract and consolidate shared Claude and Gemini conversations"
+    )
+
 
 RESUME_PROMPT = (
     "Continuing from previous session. "
@@ -76,8 +91,8 @@ def _wait_for_cloudflare(page):
         pass  # Fall through to manual prompt
 
 
-def _extract_messages(page):
-    """Extract conversation messages from the page."""
+def _extract_messages_claude(page):
+    """Extract conversation messages from a Claude share page."""
     return page.evaluate("""
         () => {
             const messages = [];
@@ -96,6 +111,52 @@ def _extract_messages(page):
                         role: role,
                         content: text.trim()
                     });
+                }
+            });
+
+            return messages;
+        }
+    """)
+
+
+def _extract_messages_gemini(page):
+    """Extract conversation messages from a Gemini share page.
+
+    Gemini share pages wrap each Q/A pair in a <share-turn-viewer> custom
+    element containing one <user-query-content> and one <response-container>
+    (which holds a <message-content>). The "You said" prefix in user text is
+    an a11y label concatenated into innerText — strip it.
+    """
+    return page.evaluate("""
+        () => {
+            const messages = [];
+            const turns = document.querySelectorAll('share-turn-viewer');
+
+            turns.forEach((turn, i) => {
+                const userEl = turn.querySelector('user-query-content');
+                if (userEl) {
+                    const text = (userEl.innerText || '')
+                        .replace(/^You said\\s+/, '')
+                        .trim();
+                    if (text && text.length > 10) {
+                        messages.push({
+                            index: i * 2,
+                            role: 'user',
+                            content: text
+                        });
+                    }
+                }
+
+                const modelEl = turn.querySelector('response-container message-content');
+                if (modelEl) {
+                    const text = (modelEl.innerText || '').trim();
+                    if (text && text.length > 10) {
+                        messages.push({
+                            index: i * 2 + 1,
+                            role: 'assistant',
+                            content: text
+                        });
+                    }
                 }
             });
 
@@ -128,8 +189,27 @@ def _extract_artifacts(page):
     """)
 
 
-def _build_markdown(url, messages, artifacts):
-    """Build consolidated markdown from extracted data."""
+PROVIDERS = {
+    "claude": {
+        "url_prefix": "https://claude.ai/share/",
+        "extract_messages": _extract_messages_claude,
+        "label": "Claude",
+    },
+    "gemini": {
+        "url_prefix": "https://gemini.google.com/share/",
+        "extract_messages": _extract_messages_gemini,
+        "label": "Gemini",
+    },
+}
+
+
+def _build_markdown(url, messages, artifacts, assistant_label='Claude'):
+    """Build consolidated markdown from extracted data.
+
+    assistant_label is the human-readable name shown for assistant
+    turns (e.g. 'Claude' or 'Gemini'). The export header stays
+    Claude-branded since the tool is called claude-chat-extractor.
+    """
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     lines = [
@@ -137,6 +217,7 @@ def _build_markdown(url, messages, artifacts):
         "",
         f"**Exported**: {now}",
         f"**Source**: {url}",
+        f"**Assistant**: {assistant_label}",
         f"**Messages**: {len(messages)}",
         f"**Artifacts**: {len(artifacts)}",
         "",
@@ -161,7 +242,7 @@ def _build_markdown(url, messages, artifacts):
         if msg['role'] == 'user':
             role = "👤 **User**"
         else:
-            role = "🤖 **Claude**"
+            role = f"🤖 **{assistant_label}**"
         lines.extend([f"### {role}", "", msg['content'], "", "---", ""])
 
     # Artifacts section
@@ -194,21 +275,29 @@ def _build_markdown(url, messages, artifacts):
 
 
 def fetch_chat(url, format_type='markdown', work_dir=None,
-               keep_html=False):
+               keep_html=False, provider='claude'):
     """
-    Fetch Claude chat content using browser automation.
+    Fetch shared chat content using browser automation.
 
     Args:
-        url: Claude share URL
+        url: Share URL (Claude or Gemini)
         format_type: Output format ('markdown' or 'pdf')
         work_dir: Directory for intermediate files (only needed
                   for pdf or --keep-* flags)
         keep_html: Whether to save HTML file
+        provider: Key into PROVIDERS ('claude' or 'gemini')
 
     Returns:
         dict with keys: messages, artifacts, metadata,
               and optionally pdf_path
     """
+    if provider not in PROVIDERS:
+        raise ValueError(
+            f"Unknown provider {provider!r}. "
+            f"Expected one of: {list(PROVIDERS)}"
+        )
+    extract_messages = PROVIDERS[provider]["extract_messages"]
+
     print(f"🌐 Fetching chat from: {url}")
 
     with sync_playwright() as p:
@@ -259,7 +348,7 @@ def fetch_chat(url, format_type='markdown', work_dir=None,
             print(f"✅ PDF saved: {pdf_path}")
 
         # Extract data
-        messages = _extract_messages(page)
+        messages = extract_messages(page)
         print("📦 Extracting artifacts...")
         artifacts = _extract_artifacts(page)
         print(f"   Found {len(artifacts)} code artifacts")
@@ -282,11 +371,13 @@ def fetch_chat(url, format_type='markdown', work_dir=None,
 
 
 def consolidate_markdown(url, messages, artifacts,
-                         output_file):
+                         output_file, assistant_label='Claude'):
     """Build and write consolidated markdown file."""
     print(f"\n📝 Writing: {output_file}")
 
-    content = _build_markdown(url, messages, artifacts)
+    content = _build_markdown(
+        url, messages, artifacts, assistant_label=assistant_label
+    )
     output_file.write_text(content, encoding='utf-8')
 
     size_kb = output_file.stat().st_size / 1024
@@ -298,7 +389,7 @@ def consolidate_markdown(url, messages, artifacts,
 def main():
     """Main entry point with CLI."""
     parser = argparse.ArgumentParser(
-        description='Extract and consolidate Claude shared chats',
+        description=__description__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -317,8 +408,15 @@ Examples:
     )
 
     parser.add_argument(
+        '--version', '-V',
+        action='version',
+        version=f'%(prog)s {__version__}\n{__description__}',
+    )
+
+    parser.add_argument(
         'url',
-        help='Claude share URL (e.g., https://claude.ai/share/...)'
+        help=('Share URL (Claude: https://claude.ai/share/... '
+              'or Gemini: https://gemini.google.com/share/...)')
     )
 
     parser.add_argument(
@@ -355,7 +453,26 @@ Examples:
         help='Save intermediate HTML file to work dir'
     )
 
+    parser.add_argument(
+        '--provider',
+        choices=list(PROVIDERS.keys()),
+        default=None,
+        help=('AI provider to extract from. Auto-detected '
+              'from URL hostname if omitted.')
+    )
+
     args = parser.parse_args()
+
+    # Auto-detect provider from URL hostname if not specified.
+    # Falls back to 'claude' to preserve pre-v1.2.0 default behavior.
+    if args.provider is None:
+        args.provider = next(
+            (
+                name for name, cfg in PROVIDERS.items()
+                if args.url.startswith(cfg["url_prefix"])
+            ),
+            'claude',
+        )
 
     # Set default output paths
     if args.output is None:
@@ -373,11 +490,13 @@ Examples:
     if args.work_dir is None and needs_work_dir:
         args.work_dir = Path('consolidated_chat')
 
-    # Validate URL
-    if not args.url.startswith('https://claude.ai/share/'):
-        print("⚠️  Warning: URL doesn't look like a "
-              "Claude share link")
-        print("   Expected: https://claude.ai/share/...")
+    # Validate URL against the selected provider's prefix
+    expected_prefix = PROVIDERS[args.provider]["url_prefix"]
+    provider_label = PROVIDERS[args.provider]["label"]
+    if not args.url.startswith(expected_prefix):
+        print(f"⚠️  Warning: URL doesn't look like a "
+              f"{provider_label} share link")
+        print(f"   Expected: {expected_prefix}...")
         print(f"   Got: {args.url}")
         response = input("   Continue anyway? (y/N): ")
         if response.lower() != 'y':
@@ -388,6 +507,7 @@ Examples:
     print("Claude Chat Extractor")
     print("=" * 70)
     print(f"URL:        {args.url}")
+    print(f"Provider:   {provider_label}")
     print(f"Format:     {args.format}")
     print(f"Output:     {args.output}")
     print("=" * 70)
@@ -399,6 +519,7 @@ Examples:
             format_type=args.format,
             work_dir=args.work_dir,
             keep_html=args.keep_html,
+            provider=args.provider,
         )
 
         if args.format == 'markdown':
@@ -407,6 +528,7 @@ Examples:
                 messages=result['messages'],
                 artifacts=result['artifacts'],
                 output_file=args.output,
+                assistant_label=provider_label,
             )
 
             # Save individual artifacts if requested
