@@ -35,7 +35,7 @@ try:
     __version__ = _pkg_meta["Version"]
     __description__ = _pkg_meta["Summary"]
 except (ImportError, PackageNotFoundError):
-    __version__ = "1.4.0"
+    __version__ = "1.5.0"
     __description__ = (
         "Extract and consolidate shared Claude and Gemini conversations"
     )
@@ -260,13 +260,18 @@ def _enrich_metadata(provider, url, raw):
     Returns: {'title': str, 'created_date': 'YYYY-MM-DD' or None, ...}
     The created_date is the chat-creation date when we can determine
     it (Gemini page header, ChatGPT URL hex), else None.
+
+    ChatGPT date decoding follows the URL hostname rather than the
+    registry key — same philosophy as the v1.4 label fix. So a
+    chatgpt.com URL handled by the fallback Claude extractor still
+    gets a correct chat-creation date in the filename.
     """
     raw = raw or {}
     title = (raw.get('title') or '').strip()
     created_date = None
     if provider == 'gemini':
         created_date = _gemini_iso_date_from_text(raw.get('createdRaw'))
-    elif provider == 'chatgpt':
+    if not created_date and _provider_label_from_url(url) == 'chatgpt':
         created_date = _chatgpt_iso_date_from_url(url)
     return {
         'title': title,
@@ -277,7 +282,10 @@ def _enrich_metadata(provider, url, raw):
     }
 
 
-def _compute_auto_filename(provider, url, chat_metadata, format_type, output_dir):
+def _compute_auto_filename(
+    provider, url, chat_metadata, format_type, output_dir,
+    title_override=None,
+):
     """Build a Windows-safe filename from chat metadata.
 
     Pattern: consolidated_chat-YYYY-MM-DD-<provider>-<title-slug>.<ext>
@@ -285,15 +293,20 @@ def _compute_auto_filename(provider, url, chat_metadata, format_type, output_dir
       1. chat_metadata['created_date'] if present (Gemini, ChatGPT)
       2. today's local date (Claude, or providers where date is missing)
     Title precedence:
-      1. chat_metadata['title'] if non-empty
-      2. literal "untitled" — keeps the filename parseable for
+      1. title_override (from --slug CLI flag) if non-empty — runs
+         through the same Windows-safe slug sanitizer as extracted titles
+      2. chat_metadata['title'] if non-empty (extracted from share page)
+      3. literal "untitled" — keeps the filename parseable for
          downstream tools and grep
     Adds _1, _2, ... suffix on collision so parallel runs of
     different chats won't overwrite each other.
     """
     date = (chat_metadata or {}).get('created_date') or datetime.now().strftime('%Y-%m-%d')
-    title = (chat_metadata or {}).get('title') or ''
-    title_slug = _windows_safe_slug(title) or 'untitled'
+    if title_override:
+        title_slug = _windows_safe_slug(title_override) or 'untitled'
+    else:
+        title = (chat_metadata or {}).get('title') or ''
+        title_slug = _windows_safe_slug(title) or 'untitled'
     ext = 'pdf' if format_type == 'pdf' else 'md'
     # Filename's provider component comes from the URL hostname, not
     # the PROVIDERS registry key — so a ChatGPT URL handled by the
@@ -742,6 +755,17 @@ Examples:
               'from URL hostname if omitted.')
     )
 
+    parser.add_argument(
+        '--slug',
+        type=str,
+        default=None,
+        help=('Override the title portion of the auto-generated '
+              'filename (e.g. --slug "3. AI Harness Terminology"). '
+              'Sanitized for Windows-safe filenames. Useful when the '
+              'extracted title is missing or unhelpful, or when you '
+              'want a name that matches your filing scheme.')
+    )
+
     args = parser.parse_args()
 
     # Track whether the user explicitly chose an output path. If they
@@ -835,6 +859,7 @@ Examples:
                     chat_metadata=result.get('chat_metadata'),
                     format_type=args.format,
                     output_dir=args.output.parent,
+                    title_override=args.slug,
                 )
                 if auto != args.output:
                     args.output.rename(auto)
@@ -885,6 +910,7 @@ Examples:
                     chat_metadata=result.get('chat_metadata'),
                     format_type=args.format,
                     output_dir=args.output.parent,
+                    title_override=args.slug,
                 )
                 if auto != args.output:
                     args.output.rename(auto)

@@ -226,6 +226,18 @@ This decouples the filename from internal extractor selection — pointing the t
 
 If you'd rather keep the old `consolidated_chat.md` filename, pass `-o consolidated_chat.md` explicitly — the auto-rename only fires when `-o` is omitted.
 
+### Overriding only the title portion with `--slug`
+
+Sometimes the chat title extracted from the page is missing, truncated, or just unhelpful — especially when the share page hides the title (e.g., a ChatGPT URL run through the fallback extractor). The `--slug` flag lets you replace just the title component of the auto-generated filename while keeping the date and provider auto-derived:
+
+```bash
+claude-chat-extractor https://chatgpt.com/share/69f75637-87c4-83ea-bbb6-c2a5a0e2e2ec \
+  --slug "3. AI Harness Terminology Explained"
+# → consolidated_chat-2026-05-03-chatgpt-3._AI_Harness_Terminology_Explained.md
+```
+
+Whatever string you pass is run through the same Windows-safe sanitizer as auto-extracted titles (invalid chars → `_`, length cap at 80, reserved-name protection). When `--slug` is omitted, the tool falls back to the page-extracted title, then to `untitled` if nothing usable is available. `--slug` is ignored when `-o` is given (an explicit output path takes precedence over any auto-naming).
+
 ## Arguments
 
 ```text
@@ -243,6 +255,8 @@ optional:
   --keep-html              Save intermediate HTML to work dir
   --provider {claude,gemini}
                            AI provider (auto-detected from URL hostname)
+  --slug TEXT              Override the title portion of the auto-generated
+                           filename (sanitized for Windows). Ignored if -o is given.
 ```
 
 ## Requirements
