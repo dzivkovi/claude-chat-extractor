@@ -23,6 +23,7 @@ import re
 import shutil
 from pathlib import Path
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 # Single source of truth: pyproject.toml. importlib.metadata reads the
 # installed package's metadata (populated by setuptools at build/install
@@ -34,7 +35,7 @@ try:
     __version__ = _pkg_meta["Version"]
     __description__ = _pkg_meta["Summary"]
 except (ImportError, PackageNotFoundError):
-    __version__ = "1.3.0"
+    __version__ = "1.4.0"
     __description__ = (
         "Extract and consolidate shared Claude and Gemini conversations"
     )
@@ -112,6 +113,59 @@ def _gemini_iso_date_from_text(text):
         return f"{int(m.group(3)):04d}-{month:02d}-{int(m.group(2)):02d}"
     except ValueError:
         return None
+
+
+def _provider_label_from_url(url):
+    """Derive the filename's provider component from a URL hostname.
+
+    Rule: take the leftmost label of the hostname, lowercased. A leading
+    'www.' is stripped first. So:
+        https://claude.ai/share/...        -> 'claude'
+        https://chatgpt.com/share/...      -> 'chatgpt'
+        https://gemini.google.com/share/.. -> 'gemini'
+
+    This decouples the filename from the PROVIDERS registry key, so a
+    ChatGPT URL run with the (current, fallback) Claude extractor still
+    gets filed under 'chatgpt' in the filename — matching the URL the
+    user actually pointed at.
+    """
+    if not url:
+        return None
+    try:
+        host = (urlparse(url).hostname or '').lower()
+    except (ValueError, AttributeError):
+        return None
+    if host.startswith('www.'):
+        host = host[4:]
+    if not host:
+        return None
+    label = host.split('.', 1)[0]
+    return label or None
+
+
+# Display capitalization for provider names with non-trivial casing.
+# Anything not in this dict gets `.title()`-cased — fine for 'claude',
+# 'gemini', and any single-word provider, wrong for 'chatgpt' which
+# would otherwise become 'Chatgpt'.
+_PROVIDER_DISPLAY_LABELS = {
+    'claude': 'Claude',
+    'chatgpt': 'ChatGPT',
+    'gemini': 'Gemini',
+}
+
+
+def _provider_display_label_from_url(url, fallback='AI'):
+    """Human-friendly provider name for headers and role markers.
+
+    Same source-of-truth as the filename label (URL hostname), but
+    capitalized for places it shows up in prose: the markdown header's
+    'Assistant:' field, the per-message '🤖 **{name}**' role marker,
+    and the 'Provider:' line printed at the start of a run.
+    """
+    key = _provider_label_from_url(url)
+    if not key:
+        return fallback
+    return _PROVIDER_DISPLAY_LABELS.get(key, key.title())
 
 
 def _chatgpt_iso_date_from_url(url):
@@ -241,7 +295,11 @@ def _compute_auto_filename(provider, url, chat_metadata, format_type, output_dir
     title = (chat_metadata or {}).get('title') or ''
     title_slug = _windows_safe_slug(title) or 'untitled'
     ext = 'pdf' if format_type == 'pdf' else 'md'
-    base = f'consolidated_chat-{date}-{provider}-{title_slug}'
+    # Filename's provider component comes from the URL hostname, not
+    # the PROVIDERS registry key — so a ChatGPT URL handled by the
+    # fallback Claude extractor still files under 'chatgpt'.
+    label = _provider_label_from_url(url) or provider
+    base = f'consolidated_chat-{date}-{label}-{title_slug}'
     candidate = output_dir / f'{base}.{ext}'
     if not candidate.exists():
         return candidate
@@ -721,10 +779,16 @@ Examples:
 
     # Validate URL against the selected provider's prefix
     expected_prefix = PROVIDERS[args.provider]["url_prefix"]
-    provider_label = PROVIDERS[args.provider]["label"]
+    registry_label = PROVIDERS[args.provider]["label"]
+    # Display label comes from the URL hostname when possible, so a
+    # chatgpt.com URL handled by the fallback Claude extractor is still
+    # labeled "ChatGPT" in headers (filename, markdown, console).
+    display_label = _provider_display_label_from_url(
+        args.url, fallback=registry_label
+    )
     if not args.url.startswith(expected_prefix):
         print(f"⚠️  Warning: URL doesn't look like a "
-              f"{provider_label} share link")
+              f"{registry_label} share link")
         print(f"   Expected: {expected_prefix}...")
         print(f"   Got: {args.url}")
         response = input("   Continue anyway? (y/N): ")
@@ -736,7 +800,7 @@ Examples:
     print("Claude Chat Extractor")
     print("=" * 70)
     print(f"URL:        {args.url}")
-    print(f"Provider:   {provider_label}")
+    print(f"Provider:   {display_label}")
     print(f"Format:     {args.format}")
     print(f"Output:     {args.output}")
     print("=" * 70)
@@ -757,7 +821,7 @@ Examples:
                 messages=result['messages'],
                 artifacts=result['artifacts'],
                 output_file=args.output,
-                assistant_label=provider_label,
+                assistant_label=display_label,
             )
 
             # Auto-rename when -o was not given. Pattern:

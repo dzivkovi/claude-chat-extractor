@@ -207,9 +207,20 @@ consolidated_chat-2026-05-03-claude-Personal_AI_Agents_in_2026_Convergence.md
 
 This means you can run multiple extractions in the same folder in parallel without one overwriting another — different chats produce different filenames automatically. If a name collides anyway (same chat re-extracted, or two chats that auto-titled identically), the second write gets a `_1`, `_2`, … suffix.
 
+**Provider component is derived from the URL, not the registry.** Whatever the leftmost label of the hostname is (lowercased, with a leading `www.` stripped) becomes the provider slug in the filename:
+
+```text
+https://claude.ai/share/...        →  claude
+https://chatgpt.com/share/...      →  chatgpt
+https://gemini.google.com/share/.. →  gemini
+```
+
+This decouples the filename from internal extractor selection — pointing the tool at a `chatgpt.com` URL produces a `chatgpt`-prefixed file even when the actual extraction is handled by a fallback strategy.
+
 **Date precedence per provider:**
 
 - **Gemini** — uses the "Created with Pro April 8, 2026 at 07:24 PM" line from the share page header. This is the **actual chat-creation date.**
+- **ChatGPT** — decodes the Unix timestamp from the first 8 hex chars of the share URL (UUID v8 format). This is the **share-creation moment**, ≈ chat-end time for short chats.
 - **Claude** — Anthropic strips chat dates from share pages (verified across multiple URLs), so the date falls back to **today** (when you ran the tool). Filenames will still be unique because the chat title differs, but the date won't reflect when the conversation actually happened.
 - The filename is sanitized for **NTFS / Microsoft Windows**: invalid characters (`< > : " / \ | ? *`) become underscores, runs of underscores collapse to one, reserved device names (`CON`, `PRN`, `COM1`, …) get a leading underscore added, length is capped at 80 chars for the title slug.
 
