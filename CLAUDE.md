@@ -65,9 +65,10 @@ src/claude_chat_extractor/
 - Navigates to the share URL with manual CAPTCHA handling
 - Waits for user input to confirm page load
 - Dispatches to `PROVIDERS[provider]['extract_messages']` for message extraction
+- Dispatches to `PROVIDERS[provider]['extract_metadata']` for chat title + creation-date extraction; result is enriched by `_enrich_metadata()` (parses Gemini date strings to ISO, decodes ChatGPT URL hex when applicable) and returned under the `chat_metadata` key
 - Extracts code artifacts from `<pre><code>` blocks (shared across providers; unverified for Gemini)
 - Saves intermediate files: `conversation.json`, `artifact_code_*.{ext}`, optionally `chat_complete.html`
-- Returns metadata dict with message count, artifact count, and optionally `pdf_path`
+- Returns metadata dict with message count, artifact count, `chat_metadata`, and optionally `pdf_path`
 
 **Provider-specific extraction shapes** — *structurally different, not just different selectors*:
 

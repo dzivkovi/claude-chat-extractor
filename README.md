@@ -181,7 +181,7 @@ The output format is identical for both providers — the assistant's role label
 
 ## Output
 
-Creates `consolidated_chat.md` containing:
+Creates a single markdown file containing:
 
 - Metadata header (source URL, message count, artifact count)
 - Complete conversation text with role markers
@@ -189,6 +189,31 @@ Creates `consolidated_chat.md` containing:
 - Table of contents for artifact navigation
 
 Format optimized for LLM consumption. No intermediate folders created by default.
+
+### Auto-named output files (v1.3.0+)
+
+When you don't pass `-o`, the tool extracts the chat title from the share page and renames the output file accordingly:
+
+```text
+consolidated_chat-<YYYY-MM-DD>-<provider>-<chat_title_slug>.md
+```
+
+Example outputs:
+
+```text
+consolidated_chat-2026-04-08-gemini-Deciphering_Project_Plan_Notes.md
+consolidated_chat-2026-05-03-claude-Personal_AI_Agents_in_2026_Convergence.md
+```
+
+This means you can run multiple extractions in the same folder in parallel without one overwriting another — different chats produce different filenames automatically. If a name collides anyway (same chat re-extracted, or two chats that auto-titled identically), the second write gets a `_1`, `_2`, … suffix.
+
+**Date precedence per provider:**
+
+- **Gemini** — uses the "Created with Pro April 8, 2026 at 07:24 PM" line from the share page header. This is the **actual chat-creation date.**
+- **Claude** — Anthropic strips chat dates from share pages (verified across multiple URLs), so the date falls back to **today** (when you ran the tool). Filenames will still be unique because the chat title differs, but the date won't reflect when the conversation actually happened.
+- The filename is sanitized for **NTFS / Microsoft Windows**: invalid characters (`< > : " / \ | ? *`) become underscores, runs of underscores collapse to one, reserved device names (`CON`, `PRN`, `COM1`, …) get a leading underscore added, length is capped at 80 chars for the title slug.
+
+If you'd rather keep the old `consolidated_chat.md` filename, pass `-o consolidated_chat.md` explicitly — the auto-rename only fires when `-o` is omitted.
 
 ## Arguments
 
@@ -198,7 +223,8 @@ positional:
 
 optional:
   -V, --version            Print installed version and description, then exit
-  -o, --output PATH        Output file path (default: consolidated_chat.md)
+  -o, --output PATH        Output file path. If omitted, the tool auto-names
+                           the file from the chat title and date (see "Output").
   -f, --format FORMAT      markdown (default) or pdf
   -w, --work-dir PATH      Working directory for intermediate files
                            (only created when needed)

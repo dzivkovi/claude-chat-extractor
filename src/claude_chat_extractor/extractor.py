@@ -19,9 +19,10 @@ except ImportError:
     USING_PATCHRIGHT = False
 import argparse
 import json
+import re
 import shutil
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Single source of truth: pyproject.toml. importlib.metadata reads the
 # installed package's metadata (populated by setuptools at build/install
@@ -33,7 +34,7 @@ try:
     __version__ = _pkg_meta["Version"]
     __description__ = _pkg_meta["Summary"]
 except (ImportError, PackageNotFoundError):
-    __version__ = "1.2.0"
+    __version__ = "1.3.0"
     __description__ = (
         "Extract and consolidate shared Claude and Gemini conversations"
     )
@@ -44,6 +45,211 @@ RESUME_PROMPT = (
     "Context attached. "
     "Continue from where we left off."
 )
+
+
+# Windows-invalid path characters: < > : " / \ | ? * and control chars (0x00-0x1F).
+# Trailing dots and spaces are also forbidden on NTFS, handled by .strip() below.
+_WIN_INVALID_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+# Reserved device names — case-insensitive, with or without extension.
+_WIN_RESERVED_NAMES = (
+    {'CON', 'PRN', 'AUX', 'NUL'}
+    | {f'COM{i}' for i in range(1, 10)}
+    | {f'LPT{i}' for i in range(1, 10)}
+)
+
+# Months for parsing Gemini's "Created with Pro April 8, 2026 at 07:24 PM"
+_MONTH_NAMES = {
+    'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5,
+    'june': 6, 'july': 7, 'august': 8, 'september': 9, 'october': 10,
+    'november': 11, 'december': 12,
+}
+
+
+def _windows_safe_slug(text, max_len=80):
+    """Slugify a chat title into a filename component safe on Windows.
+
+    Replaces invalid characters with underscores, collapses whitespace
+    runs, strips leading/trailing punctuation that NTFS rejects, caps
+    length, and avoids reserved device names like CON/PRN/COM1.
+    """
+    if not text:
+        return ''
+    s = _WIN_INVALID_CHARS_RE.sub('_', text)
+    s = re.sub(r'\s+', '_', s.strip())
+    # Collapse runs of underscores so we don't get ugly "Title__Subtitle"
+    # when an invalid character sat next to a space.
+    s = re.sub(r'_+', '_', s)
+    # NTFS forbids trailing dots/spaces, and leading/trailing dashes
+    # or underscores look ugly. Strip them all.
+    s = s.strip('._- ')
+    if len(s) > max_len:
+        s = s[:max_len].rstrip('._- ')
+    # Reserved-name protection. The check is on the part before any dot
+    # since "CON.md" is also reserved.
+    base = s.split('.', 1)[0].upper()
+    if base in _WIN_RESERVED_NAMES:
+        s = '_' + s
+    return s
+
+
+def _gemini_iso_date_from_text(text):
+    """Parse 'April 8, 2026 at 07:24 PM' (or similar) into 'YYYY-MM-DD'.
+
+    Returns None if the text doesn't contain a recognizable English-month
+    + day + year triple. Locale-sensitive by design — Gemini renders
+    these in the user's UI language.
+    """
+    if not text:
+        return None
+    m = re.search(r'\b(\w+)\s+(\d{1,2}),?\s+(\d{4})\b', text)
+    if not m:
+        return None
+    month = _MONTH_NAMES.get(m.group(1).lower())
+    if not month:
+        return None
+    try:
+        return f"{int(m.group(3)):04d}-{month:02d}-{int(m.group(2)):02d}"
+    except ValueError:
+        return None
+
+
+def _chatgpt_iso_date_from_url(url):
+    """Decode the chat-creation date from a ChatGPT share URL.
+
+    ChatGPT share IDs are UUID v8: the first 8 hex chars are the
+    Unix timestamp (seconds, big-endian) of when the share link was
+    created, which is approximately the chat-end time for short
+    chats. Returns None if the URL doesn't match the share pattern.
+    """
+    if not url:
+        return None
+    m = re.search(r'/share/([0-9a-f]{8})', url)
+    if not m:
+        return None
+    try:
+        ts = int(m.group(1), 16)
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d')
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def _extract_chat_metadata_claude(page):
+    """Extract chat title (and shared-by name, if visible) from Claude.
+
+    Claude share pages render the chat title as the text inside
+    <div class="truncate text-text-300">, prefixed with a leading
+    "+" UI artifact that we strip. There is no chat-creation date
+    available on the share page — Anthropic strips it.
+    """
+    return page.evaluate("""
+        () => {
+            const titleEl = document.querySelector('div.truncate.text-text-300');
+            let title = titleEl ? (titleEl.innerText || '').trim() : '';
+            if (title.startsWith('+')) title = title.slice(1).trim();
+            if (!title) {
+                const h1 = document.querySelector('h1');
+                title = h1 ? (h1.innerText || '').trim() : '';
+            }
+            const sharedByMatch = (document.body.innerText || '').match(/Shared by\\s+([^\\n]+)/);
+            return {
+                title: title,
+                sharedBy: sharedByMatch ? sharedByMatch[1].trim() : null,
+                createdRaw: null,
+            };
+        }
+    """)
+
+
+def _extract_chat_metadata_gemini(page):
+    """Extract chat title and creation date from a Gemini share page.
+
+    Gemini's <.share-title-section> contains the title (in <strong>),
+    the share URL, then two visible date lines:
+      "Created with [tier] April 8, 2026 at 07:24 PM"
+      "Published April 11, 2026 at 07:02 PM"
+    We capture the raw "Created" text and parse to ISO Python-side.
+    """
+    return page.evaluate("""
+        () => {
+            const section = document.querySelector('.share-title-section');
+            let title = '';
+            let createdRaw = null;
+            let publishedRaw = null;
+            if (section) {
+                const strongEl = section.querySelector('strong');
+                title = strongEl ? strongEl.textContent.trim() : '';
+                const lines = section.innerText.split('\\n').map(s => s.trim()).filter(Boolean);
+                for (const line of lines) {
+                    const cm = line.match(/^Created(?:\\s+with\\s+\\S+)?\\s+(.+)$/);
+                    if (cm) createdRaw = cm[1].trim();
+                    const pm = line.match(/^Published\\s+(.+)$/);
+                    if (pm) publishedRaw = pm[1].trim();
+                }
+            }
+            if (!title) {
+                const h1 = document.querySelector('h1');
+                title = h1 ? (h1.innerText || '').trim() : '';
+            }
+            return {
+                title: title,
+                createdRaw: createdRaw,
+                publishedRaw: publishedRaw,
+            };
+        }
+    """)
+
+
+def _enrich_metadata(provider, url, raw):
+    """Normalize per-provider raw metadata into a unified shape.
+
+    Returns: {'title': str, 'created_date': 'YYYY-MM-DD' or None, ...}
+    The created_date is the chat-creation date when we can determine
+    it (Gemini page header, ChatGPT URL hex), else None.
+    """
+    raw = raw or {}
+    title = (raw.get('title') or '').strip()
+    created_date = None
+    if provider == 'gemini':
+        created_date = _gemini_iso_date_from_text(raw.get('createdRaw'))
+    elif provider == 'chatgpt':
+        created_date = _chatgpt_iso_date_from_url(url)
+    return {
+        'title': title,
+        'created_date': created_date,
+        'shared_by': raw.get('sharedBy'),
+        'created_raw': raw.get('createdRaw'),
+        'published_raw': raw.get('publishedRaw'),
+    }
+
+
+def _compute_auto_filename(provider, url, chat_metadata, format_type, output_dir):
+    """Build a Windows-safe filename from chat metadata.
+
+    Pattern: consolidated_chat-YYYY-MM-DD-<provider>-<title-slug>.<ext>
+    Date precedence:
+      1. chat_metadata['created_date'] if present (Gemini, ChatGPT)
+      2. today's local date (Claude, or providers where date is missing)
+    Title precedence:
+      1. chat_metadata['title'] if non-empty
+      2. literal "untitled" — keeps the filename parseable for
+         downstream tools and grep
+    Adds _1, _2, ... suffix on collision so parallel runs of
+    different chats won't overwrite each other.
+    """
+    date = (chat_metadata or {}).get('created_date') or datetime.now().strftime('%Y-%m-%d')
+    title = (chat_metadata or {}).get('title') or ''
+    title_slug = _windows_safe_slug(title) or 'untitled'
+    ext = 'pdf' if format_type == 'pdf' else 'md'
+    base = f'consolidated_chat-{date}-{provider}-{title_slug}'
+    candidate = output_dir / f'{base}.{ext}'
+    if not candidate.exists():
+        return candidate
+    for i in range(1, 1000):
+        candidate = output_dir / f'{base}_{i}.{ext}'
+        if not candidate.exists():
+            return candidate
+    return output_dir / f'{base}.{ext}'  # last-resort overwrite
 
 
 def _launch_browser(p):
@@ -193,11 +399,13 @@ PROVIDERS = {
     "claude": {
         "url_prefix": "https://claude.ai/share/",
         "extract_messages": _extract_messages_claude,
+        "extract_metadata": _extract_chat_metadata_claude,
         "label": "Claude",
     },
     "gemini": {
         "url_prefix": "https://gemini.google.com/share/",
         "extract_messages": _extract_messages_gemini,
+        "extract_metadata": _extract_chat_metadata_gemini,
         "label": "Gemini",
     },
 }
@@ -297,6 +505,7 @@ def fetch_chat(url, format_type='markdown', work_dir=None,
             f"Expected one of: {list(PROVIDERS)}"
         )
     extract_messages = PROVIDERS[provider]["extract_messages"]
+    extract_metadata = PROVIDERS[provider]["extract_metadata"]
 
     print(f"🌐 Fetching chat from: {url}")
 
@@ -353,6 +562,19 @@ def fetch_chat(url, format_type='markdown', work_dir=None,
         artifacts = _extract_artifacts(page)
         print(f"   Found {len(artifacts)} code artifacts")
 
+        # Extract chat-level metadata (title, dates, etc.) — best-effort.
+        # Failures here must not crash the run; we fall back to defaults.
+        try:
+            raw_metadata = extract_metadata(page)
+        except Exception as e:
+            print(f"   ⚠️  Metadata extraction failed: {e}")
+            raw_metadata = {}
+        chat_metadata = _enrich_metadata(provider, url, raw_metadata)
+        if chat_metadata.get('title'):
+            print(f"   Chat title: {chat_metadata['title']}")
+        if chat_metadata.get('created_date'):
+            print(f"   Chat created: {chat_metadata['created_date']}")
+
         context.close()
 
         metadata = {
@@ -366,6 +588,7 @@ def fetch_chat(url, format_type='markdown', work_dir=None,
             'messages': messages,
             'artifacts': artifacts,
             'metadata': metadata,
+            'chat_metadata': chat_metadata,
             'pdf_path': pdf_path,
         }
 
@@ -422,8 +645,8 @@ Examples:
     parser.add_argument(
         '--output', '-o',
         type=Path,
-        help=('Output file path (default: '
-              'consolidated_chat.md or chat.pdf)')
+        help=('Output file path. If omitted, the file is auto-named '
+              'consolidated_chat-<date>-<provider>-<title>.md|pdf')
     )
 
     parser.add_argument(
@@ -462,6 +685,12 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    # Track whether the user explicitly chose an output path. If they
+    # did, we honor it verbatim; if not, we'll auto-name the file from
+    # the chat metadata so parallel extractions don't overwrite each
+    # other in the same folder.
+    user_specified_output = args.output is not None
 
     # Auto-detect provider from URL hostname if not specified.
     # Falls back to 'claude' to preserve pre-v1.2.0 default behavior.
@@ -531,6 +760,22 @@ Examples:
                 assistant_label=provider_label,
             )
 
+            # Auto-rename when -o was not given. Pattern:
+            #   consolidated_chat-YYYY-MM-DD-<provider>-<title-slug>.md
+            # Skips on collision with _N suffix so parallel runs of
+            # different chats land in unique files.
+            if not user_specified_output:
+                auto = _compute_auto_filename(
+                    provider=args.provider,
+                    url=args.url,
+                    chat_metadata=result.get('chat_metadata'),
+                    format_type=args.format,
+                    output_dir=args.output.parent,
+                )
+                if auto != args.output:
+                    args.output.rename(auto)
+                    args.output = auto
+
             # Save individual artifacts if requested
             if args.keep_artifacts and args.work_dir:
                 args.work_dir.mkdir(exist_ok=True)
@@ -549,6 +794,7 @@ Examples:
                 json_path = args.work_dir / "conversation.json"
                 json_path.write_text(json.dumps({
                     'metadata': result['metadata'],
+                    'chat_metadata': result.get('chat_metadata'),
                     'messages': result['messages'],
                 }, indent=2), encoding='utf-8')
 
@@ -567,6 +813,18 @@ Examples:
             pdf_source = result['pdf_path']
             if pdf_source and pdf_source != args.output:
                 shutil.move(str(pdf_source), str(args.output))
+
+            if not user_specified_output:
+                auto = _compute_auto_filename(
+                    provider=args.provider,
+                    url=args.url,
+                    chat_metadata=result.get('chat_metadata'),
+                    format_type=args.format,
+                    output_dir=args.output.parent,
+                )
+                if auto != args.output:
+                    args.output.rename(auto)
+                    args.output = auto
 
             print(f"\n🎉 Success! PDF created:")
             print(f"   {args.output.absolute()}")
