@@ -38,8 +38,9 @@ Thumbs.db
 
 # Project specific
 consolidated_chat/
-consolidated_chat.md
+consolidated_chat*.md
 *.pdf
+_probe*/
 
 # Playwright
 .playwright/

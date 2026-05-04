@@ -35,9 +35,10 @@ try:
     __version__ = _pkg_meta["Version"]
     __description__ = _pkg_meta["Summary"]
 except (ImportError, PackageNotFoundError):
-    __version__ = "1.5.0"
+    __version__ = "1.6.0"
     __description__ = (
-        "Extract and consolidate shared Claude and Gemini conversations"
+        "Extract and consolidate shared Claude, Gemini, "
+        "and ChatGPT conversations"
     )
 
 
@@ -58,6 +59,29 @@ _WIN_RESERVED_NAMES = (
     | {f'COM{i}' for i in range(1, 10)}
     | {f'LPT{i}' for i in range(1, 10)}
 )
+
+# Tombstone strings that providers leave inline where artifacts have
+# been redacted from a share view. Claude's known phrasing is
+# "Files hidden in shared chats" — we scan extracted message text for
+# any of these and surface a warning so readers (and downstream LLMs)
+# know to download attachments out-of-band.
+_HIDDEN_FILES_TOMBSTONES = (
+    'Files hidden in shared chats',
+    'File hidden in shared chats',
+)
+
+
+def _detect_hidden_files(messages):
+    """Return True if any extracted message contains an artifact-redacted
+    tombstone string. Conservative literal match — no regex — to avoid
+    false positives from messages that happen to discuss the topic."""
+    if not messages:
+        return False
+    return any(
+        any(t in (m.get('content') or '') for t in _HIDDEN_FILES_TOMBSTONES)
+        for m in messages
+    )
+
 
 # Months for parsing Gemini's "Created with Pro April 8, 2026 at 07:24 PM"
 _MONTH_NAMES = {
@@ -82,8 +106,12 @@ def _windows_safe_slug(text, max_len=80):
     # when an invalid character sat next to a space.
     s = re.sub(r'_+', '_', s)
     # NTFS forbids trailing dots/spaces, and leading/trailing dashes
-    # or underscores look ugly. Strip them all.
-    s = s.strip('._- ')
+    # or underscores look ugly. Also strip leading/trailing "+" — Daniel
+    # uses "+" as a personal importance marker on chat titles; it stays
+    # in the metadata title but is dropped from the filename ("less is
+    # more"). Only strips at the boundaries — a "+" mid-title (e.g.
+    # "C++") is preserved.
+    s = s.strip('._- +')
     if len(s) > max_len:
         s = s[:max_len].rstrip('._- ')
     # Reserved-name protection. The check is on the part before any dot
@@ -200,7 +228,8 @@ def _extract_chat_metadata_claude(page):
         () => {
             const titleEl = document.querySelector('div.truncate.text-text-300');
             let title = titleEl ? (titleEl.innerText || '').trim() : '';
-            if (title.startsWith('+')) title = title.slice(1).trim();
+            // NOTE: a leading "+" is intentionally preserved — Daniel uses it
+            // as a personal importance marker on chat titles. Do not strip.
             if (!title) {
                 const h1 = document.querySelector('h1');
                 title = h1 ? (h1.innerText || '').trim() : '';
@@ -245,10 +274,35 @@ def _extract_chat_metadata_gemini(page):
                 const h1 = document.querySelector('h1');
                 title = h1 ? (h1.innerText || '').trim() : '';
             }
+            // NOTE: a leading "+" is intentionally preserved — Daniel uses it
+            // as a personal importance marker on chat titles. Do not strip.
             return {
                 title: title,
                 createdRaw: createdRaw,
                 publishedRaw: publishedRaw,
+            };
+        }
+    """)
+
+
+def _extract_chat_metadata_chatgpt(page):
+    """Extract chat title from a ChatGPT share page.
+
+    ChatGPT stamps the chat name into <title> as 'ChatGPT - <name>',
+    so document.title is a clean source. The leading 'ChatGPT - '
+    prefix (separator can be hyphen, en-dash, or em-dash depending on
+    locale) is stripped so the title slug doesn't carry it.
+    The chat-creation date is decoded from the URL hex prefix in
+    _enrich_metadata — see _chatgpt_iso_date_from_url.
+    """
+    return page.evaluate("""
+        () => {
+            let title = (document.title || '').trim();
+            // Strip "ChatGPT - " (or - or –) prefix if present
+            title = title.replace(/^ChatGPT\\s*[-\\u2013\\u2014]\\s*/, '').trim();
+            return {
+                title: title,
+                createdRaw: null,
             };
         }
     """)
@@ -442,6 +496,50 @@ def _extract_messages_gemini(page):
     """)
 
 
+def _extract_messages_chatgpt(page):
+    """Extract conversation messages from a ChatGPT share page.
+
+    ChatGPT marks every message with a stable [data-message-author-role]
+    attribute whose value is 'user' or 'assistant'. There is one quirk
+    that is the whole reason this extractor exists: assistant messages
+    have innerText='' (the streaming markdown renderer puts content in
+    a tree where the rendered-text algorithm sees nothing) but
+    textContent is correct. So we read innerText first, fall back to
+    textContent. Verified live on a 17-message conversation: 5 user +
+    12 assistant, 62 KB of content end-to-end.
+
+    A single user prompt often yields multiple consecutive
+    'assistant' messages (preamble paragraph(s) + main answer + final
+    summary), corresponding to ChatGPT's "Thought for Ns ›" UI element
+    that bundles them. We keep them as separate messages so the
+    consolidated markdown preserves the actual exchange structure.
+    """
+    return page.evaluate("""
+        () => {
+            const messages = [];
+            const elements = document.querySelectorAll('[data-message-author-role]');
+
+            elements.forEach((el, i) => {
+                const role = el.getAttribute('data-message-author-role');
+                if (role !== 'user' && role !== 'assistant') return;
+
+                let text = (el.innerText || '').trim();
+                if (!text) text = (el.textContent || '').trim();
+
+                if (text.length < 10) return;
+
+                messages.push({
+                    index: i,
+                    role: role,
+                    content: text
+                });
+            });
+
+            return messages;
+        }
+    """)
+
+
 def _extract_artifacts(page):
     """Extract code artifacts from the page."""
     return page.evaluate("""
@@ -479,6 +577,12 @@ PROVIDERS = {
         "extract_metadata": _extract_chat_metadata_gemini,
         "label": "Gemini",
     },
+    "chatgpt": {
+        "url_prefix": "https://chatgpt.com/share/",
+        "extract_messages": _extract_messages_chatgpt,
+        "extract_metadata": _extract_chat_metadata_chatgpt,
+        "label": "ChatGPT",
+    },
 }
 
 
@@ -490,6 +594,7 @@ def _build_markdown(url, messages, artifacts, assistant_label='Claude'):
     Claude-branded since the tool is called claude-chat-extractor.
     """
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    has_hidden_files = _detect_hidden_files(messages)
 
     lines = [
         "# Claude Chat Export - Consolidated",
@@ -499,10 +604,20 @@ def _build_markdown(url, messages, artifacts, assistant_label='Claude'):
         f"**Assistant**: {assistant_label}",
         f"**Messages**: {len(messages)}",
         f"**Artifacts**: {len(artifacts)}",
+    ]
+    if has_hidden_files:
+        lines.append(
+            "**⚠️ Hidden files**: this shared chat contains file "
+            "attachments that the share page does not expose. Download "
+            "them from your authenticated chat session if you need full "
+            "context — the conversation text below references them but "
+            "their content is not included here."
+        )
+    lines.extend([
         "",
         "---",
         ""
-    ]
+    ])
 
     # Table of contents for artifacts
     if artifacts:
@@ -645,6 +760,9 @@ def fetch_chat(url, format_type='markdown', work_dir=None,
             print(f"   Chat title: {chat_metadata['title']}")
         if chat_metadata.get('created_date'):
             print(f"   Chat created: {chat_metadata['created_date']}")
+        if _detect_hidden_files(messages):
+            print("   ⚠️  Hidden file attachments detected — share page "
+                  "redacts file content; download separately if needed.")
 
         context.close()
 
@@ -801,8 +919,10 @@ Examples:
     if args.work_dir is None and needs_work_dir:
         args.work_dir = Path('consolidated_chat')
 
-    # Validate URL against the selected provider's prefix
-    expected_prefix = PROVIDERS[args.provider]["url_prefix"]
+    # Validate URL against ALL known share-link prefixes. The warning
+    # only fires when the URL doesn't match any registered provider —
+    # so a claude.ai, gemini.google.com, or chatgpt.com URL passes
+    # through silently regardless of which one --provider selected.
     registry_label = PROVIDERS[args.provider]["label"]
     # Display label comes from the URL hostname when possible, so a
     # chatgpt.com URL handled by the fallback Claude extractor is still
@@ -810,10 +930,16 @@ Examples:
     display_label = _provider_display_label_from_url(
         args.url, fallback=registry_label
     )
-    if not args.url.startswith(expected_prefix):
-        print(f"⚠️  Warning: URL doesn't look like a "
-              f"{registry_label} share link")
-        print(f"   Expected: {expected_prefix}...")
+    recognized = any(
+        args.url.startswith(cfg["url_prefix"])
+        for cfg in PROVIDERS.values()
+    )
+    if not recognized:
+        print("⚠️  Warning: URL doesn't match any known "
+              "share-link pattern")
+        print("   Recognized:")
+        for cfg in PROVIDERS.values():
+            print(f"     {cfg['url_prefix']}...")
         print(f"   Got: {args.url}")
         response = input("   Continue anyway? (y/N): ")
         if response.lower() != 'y':
