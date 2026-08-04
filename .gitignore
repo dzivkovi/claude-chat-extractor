@@ -47,3 +47,5 @@ _probe*/
 .playwright-mcp/
 
 .claude/settings.local.json
+
+work/

@@ -26,7 +26,7 @@ claude-chat-extractor https://claude.ai/share/CHAT_ID
 
 Your 200k token conversation becomes ~50k tokens (75% reduction) while preserving all content and code artifacts.
 
-**Note:** This tool extracts from Claude shared chat URLs and is designed for continuing conversations in Claude Desktop. Gemini share URLs (`gemini.google.com/share/...`) are also supported — see [Gemini support](#gemini-support-experimental) below.
+**Note:** This tool extracts from Claude shared chat URLs and is designed for continuing conversations in Claude Desktop. Gemini share URLs (`gemini.google.com/share/...` and the short-link form `share.gemini.google/...`) are also supported — see [Gemini support](#gemini-support-experimental) below.
 
 ## Why Patchright? (Cloudflare Bot Detection)
 
@@ -153,11 +153,14 @@ claude-chat-extractor CHAT_URL --keep-artifacts --keep-html
 
 ## Gemini support (experimental)
 
-In addition to Claude, the tool can extract shared Gemini conversations from `https://gemini.google.com/share/...` URLs. The provider is auto-detected from the URL hostname — no extra flag required:
+In addition to Claude, the tool can extract shared Gemini conversations from `https://gemini.google.com/share/...` URLs, as well as the short links (`https://share.gemini.google/...`) that Gemini's "Copy link" button now hands out. The provider is auto-detected from the URL hostname — no extra flag required:
 
 ```bash
 # Auto-detected as Gemini from the hostname
 claude-chat-extractor https://gemini.google.com/share/ee483c76e7a5
+
+# Short-link form works the same (redirects to the URL above)
+claude-chat-extractor https://share.gemini.google/AbCdEf123456
 
 # Or force a provider explicitly
 claude-chat-extractor --provider gemini https://gemini.google.com/share/ee483c76e7a5
@@ -165,7 +168,11 @@ claude-chat-extractor --provider gemini https://gemini.google.com/share/ee483c76
 
 The output format is identical for both providers — the assistant's role label in the markdown reflects which AI answered (`🤖 **Claude**` vs `🤖 **Gemini**`).
 
-**Why "experimental":** Gemini's share pages are Angular-based with custom elements (`<share-turn-viewer>`, `<user-query-content>`, `<message-content>`) and no public selector contract. Google may rev the DOM in future builds and silently break extraction. If a Gemini run returns 0 messages, file an issue — the fix is a selector update in the `PROVIDERS` registry in [src/claude_chat_extractor/extractor.py](src/claude_chat_extractor/extractor.py). Code-block (`<pre><code>`) extraction for Gemini conversations is also unverified; if your conversation contains code artifacts that don't appear in the output, please report it.
+**Gemini responses keep their markdown structure (v1.7.0+).** Instead of flattening the rendered page to plain text, the extractor serializes Gemini's response DOM back to markdown: headings, bold/italic, numbered and bulleted lists, blockquotes, tables, links, inline code, and code blocks with their language labels (` ```bash `, ` ```python `, …) all survive. Gemini UI decoration — source-citation chips, follow-up suggestion pills, copy buttons — is stripped instead of leaking into the transcript.
+
+**File attachments are surfaced, not silently dropped (v1.7.0+).** Share pages don't expose uploaded file contents, but each user-side attachment now appears in the transcript as a manifest line: named file chips as `[Attachment: <name>]`, uploaded images as `[Attached image: <googleusercontent-url>]` (the URL remains fetchable from the share page's CDN).
+
+**Why "experimental":** Gemini's share pages are Angular-based with custom elements (`<share-turn-viewer>`, `<user-query-content>`, `<message-content>`) and no public selector contract. Google may rev the DOM in future builds and silently break extraction. If a Gemini run returns 0 messages, file an issue — the fix is a selector update in the `PROVIDERS` registry in [src/claude_chat_extractor/extractor.py](src/claude_chat_extractor/extractor.py).
 
 ## How to Continue a Conversation
 
@@ -207,12 +214,13 @@ consolidated_chat-2026-05-03-claude-Personal_AI_Agents_in_2026_Convergence.md
 
 This means you can run multiple extractions in the same folder in parallel without one overwriting another — different chats produce different filenames automatically. If a name collides anyway (same chat re-extracted, or two chats that auto-titled identically), the second write gets a `_1`, `_2`, … suffix.
 
-**Provider component is derived from the URL, not the registry.** Whatever the leftmost label of the hostname is (lowercased, with a leading `www.` stripped) becomes the provider slug in the filename:
+**Provider component is derived from the URL, not the registry.** Whatever the leftmost label of the hostname is (lowercased, with leading `www.` and `share.` stripped) becomes the provider slug in the filename:
 
 ```text
-https://claude.ai/share/...        →  claude
-https://chatgpt.com/share/...      →  chatgpt
-https://gemini.google.com/share/.. →  gemini
+https://claude.ai/share/...          →  claude
+https://chatgpt.com/share/...        →  chatgpt
+https://gemini.google.com/share/..   →  gemini
+https://share.gemini.google/...      →  gemini
 ```
 
 This decouples the filename from internal extractor selection — pointing the tool at a `chatgpt.com` URL produces a `chatgpt`-prefixed file even when the actual extraction is handled by a fallback strategy.
@@ -253,7 +261,7 @@ optional:
                            (only created when needed)
   --keep-artifacts         Save individual artifact files to work dir
   --keep-html              Save intermediate HTML to work dir
-  --provider {claude,gemini}
+  --provider {claude,gemini,chatgpt}
                            AI provider (auto-detected from URL hostname)
   --slug TEXT              Override the title portion of the auto-generated
                            filename (sanitized for Windows). Ignored if -o is given.

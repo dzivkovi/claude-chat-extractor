@@ -35,7 +35,7 @@ try:
     __version__ = _pkg_meta["Version"]
     __description__ = _pkg_meta["Summary"]
 except (ImportError, PackageNotFoundError):
-    __version__ = "1.6.0"
+    __version__ = "1.7.0"
     __description__ = (
         "Extract and consolidate shared Claude, Gemini, "
         "and ChatGPT conversations"
@@ -146,11 +146,14 @@ def _gemini_iso_date_from_text(text):
 def _provider_label_from_url(url):
     """Derive the filename's provider component from a URL hostname.
 
-    Rule: take the leftmost label of the hostname, lowercased. A leading
-    'www.' is stripped first. So:
-        https://claude.ai/share/...        -> 'claude'
-        https://chatgpt.com/share/...      -> 'chatgpt'
-        https://gemini.google.com/share/.. -> 'gemini'
+    Rule: take the leftmost label of the hostname, lowercased. Leading
+    'www.' and 'share.' labels are stripped first — 'share' is a
+    link-shortener subdomain (Gemini's short links live at
+    share.gemini.google), not a provider name. So:
+        https://claude.ai/share/...          -> 'claude'
+        https://chatgpt.com/share/...        -> 'chatgpt'
+        https://gemini.google.com/share/..   -> 'gemini'
+        https://share.gemini.google/<id>     -> 'gemini'
 
     This decouples the filename from the PROVIDERS registry key, so a
     ChatGPT URL run with the (current, fallback) Claude extractor still
@@ -165,10 +168,12 @@ def _provider_label_from_url(url):
         return None
     if host.startswith('www.'):
         host = host[4:]
-    if not host:
+    labels = host.split('.')
+    if labels and labels[0] == 'share' and len(labels) > 1:
+        labels = labels[1:]
+    if not labels:
         return None
-    label = host.split('.', 1)[0]
-    return label or None
+    return labels[0] or None
 
 
 # Display capitalization for provider names with non-trivial casing.
@@ -457,18 +462,182 @@ def _extract_messages_gemini(page):
     element containing one <user-query-content> and one <response-container>
     (which holds a <message-content>). The "You said" prefix in user text is
     an a11y label concatenated into innerText — strip it.
+
+    Responses are serialized DOM -> markdown rather than read via innerText:
+    innerText flattens headings/lists/bold to plain text, drops code-fence
+    languages, and leaks UI noise (source-citation chips, "Copy code"
+    buttons, follow-up suggestion pills) into the transcript. The
+    serializer walks the message DOM, emits markdown for the structural
+    tags Gemini uses (h1-h6, p, ul/ol, blockquote, table, <code-block>
+    with its language label, inline code, links, bold/italic), and skips
+    Gemini's decoration elements entirely.
+
+    User-side file attachments (<user-query-file-preview>) are surfaced as
+    an "[Attachment: name]" / "[Attached image: url]" manifest appended to
+    the user message — the share page doesn't expose file contents, but
+    the image URLs (lh3.googleusercontent.com) remain fetchable and named
+    file chips keep their filename.
     """
     return page.evaluate("""
         () => {
+            // Gemini UI elements that must not leak into the transcript.
+            const SKIP_TAGS = new Set([
+                'sources-carousel-inline', 'source-footnote',
+                'source-inline-chip', 'follow-up', 'elicitations',
+                'tts-control-v2', 'button', 'mat-icon', 'gem-icon',
+                'gem-icon-button', 'style', 'script', 'link-block',
+                'chat-loading-animation', 'processing-state',
+            ]);
+
+            const fenceLang = (raw) => {
+                const s = (raw || '').trim().toLowerCase().replace(/\\s+/g, '');
+                return /^[a-z0-9_+#.-]{1,20}$/.test(s) ? s : '';
+            };
+
+            // The language name ("Bash", "Python") is the first bare text
+            // node in the code-block header, outside <pre>.
+            const codeBlockLabel = (cb) => {
+                const walker = document.createTreeWalker(cb, NodeFilter.SHOW_ELEMENT);
+                let el;
+                while ((el = walker.nextNode())) {
+                    if (el.closest('pre')) continue;
+                    if (SKIP_TAGS.has(el.tagName.toLowerCase())) continue;
+                    const own = [...el.childNodes]
+                        .filter(n => n.nodeType === 3)
+                        .map(n => n.textContent.trim())
+                        .join('');
+                    if (own) return fenceLang(own);
+                }
+                return '';
+            };
+
+            const codeBlockToMd = (cb) => {
+                const pre = cb.querySelector('pre');
+                const code = (pre ? pre.textContent : cb.textContent) || '';
+                return '\\n```' + codeBlockLabel(cb) + '\\n'
+                    + code.replace(/\\n+$/, '') + '\\n```\\n';
+            };
+
+            const tableToMd = (tbl) => {
+                const rows = [...tbl.querySelectorAll('tr')].map(tr =>
+                    [...tr.querySelectorAll('th,td')].map(c =>
+                        (c.innerText || '').trim()
+                            .replace(/\\|/g, '\\\\|')
+                            .replace(/\\n+/g, ' ')
+                    )
+                );
+                if (!rows.length) return '';
+                const lines = [
+                    '| ' + rows[0].join(' | ') + ' |',
+                    '| ' + rows[0].map(() => '---').join(' | ') + ' |',
+                ];
+                rows.slice(1).forEach(r => lines.push('| ' + r.join(' | ') + ' |'));
+                return '\\n' + lines.join('\\n') + '\\n';
+            };
+
+            function serializeChildren(node, ctx) {
+                return [...node.childNodes].map(n => serialize(n, ctx)).join('');
+            }
+
+            function serialize(node, ctx) {
+                if (node.nodeType === 3) {
+                    return node.textContent.replace(/\\s+/g, ' ');
+                }
+                if (node.nodeType !== 1) return '';
+                const tag = node.tagName.toLowerCase();
+                if (SKIP_TAGS.has(tag)) return '';
+                if (tag === 'code-block') return codeBlockToMd(node);
+                if (tag === 'table') return tableToMd(node);
+                if (tag === 'br') return '\\n';
+                if (tag === 'hr') return '\\n---\\n';
+                if (tag === 'img') return '';
+
+                const kids = () => serializeChildren(node, ctx);
+
+                if (/^h[1-6]$/.test(tag)) {
+                    const level = parseInt(tag[1], 10);
+                    return '\\n' + '#'.repeat(level) + ' ' + kids().trim() + '\\n';
+                }
+                if (tag === 'p') return '\\n' + kids().trim() + '\\n';
+                if (tag === 'blockquote') {
+                    const inner = kids().trim().split('\\n')
+                        .map(l => '> ' + l).join('\\n');
+                    return '\\n' + inner + '\\n';
+                }
+                if (tag === 'ul' || tag === 'ol') {
+                    const items = [...node.children]
+                        .filter(c => c.tagName.toLowerCase() === 'li');
+                    const indent = '  '.repeat(ctx.listDepth);
+                    const lines = items.map((li, idx) => {
+                        const marker = tag === 'ol' ? `${idx + 1}. ` : '- ';
+                        return serializeChildren(li, {listDepth: ctx.listDepth + 1})
+                            .trim().split('\\n')
+                            .map((l, j) => j === 0
+                                ? indent + marker + l
+                                : indent + '  ' + l)
+                            .join('\\n');
+                    });
+                    return '\\n' + lines.join('\\n') + '\\n';
+                }
+                if (tag === 'pre') {
+                    return '\\n```\\n'
+                        + (node.textContent || '').replace(/\\n+$/, '')
+                        + '\\n```\\n';
+                }
+                if (tag === 'code') {
+                    const t = (node.textContent || '').trim();
+                    return t ? '`' + t + '`' : '';
+                }
+                if (tag === 'a') {
+                    const href = node.getAttribute('href') || '';
+                    const t = kids().trim();
+                    if (!t) return '';
+                    return href.startsWith('http') ? `[${t}](${href})` : t;
+                }
+                if (tag === 'b' || tag === 'strong') {
+                    const t = kids().trim();
+                    return t ? `**${t}**` : '';
+                }
+                if (tag === 'i' || tag === 'em') {
+                    const t = kids().trim();
+                    return t ? `*${t}*` : '';
+                }
+                return kids();
+            }
+
+            const toMarkdown = (root) =>
+                serializeChildren(root, {listDepth: 0})
+                    .replace(/[ \\t]+\\n/g, '\\n')
+                    .replace(/\\n{3,}/g, '\\n\\n')
+                    .trim();
+
             const messages = [];
             const turns = document.querySelectorAll('share-turn-viewer');
 
             turns.forEach((turn, i) => {
                 const userEl = turn.querySelector('user-query-content');
                 if (userEl) {
-                    const text = (userEl.innerText || '')
+                    let text = (userEl.innerText || '')
                         .replace(/^You said\\s+/, '')
                         .trim();
+                    const attachments =
+                        [...turn.querySelectorAll('user-query-file-preview')]
+                        .map(p => {
+                            const chip = (p.innerText || '').trim();
+                            if (chip) {
+                                return '[Attachment: '
+                                    + chip.replace(/\\n+/g, ' - ') + ']';
+                            }
+                            const img = p.querySelector('img');
+                            const src = img ? (img.getAttribute('src') || '') : '';
+                            return src
+                                ? '[Attached image: ' + src + ']'
+                                : '[Attachment]';
+                        });
+                    if (attachments.length) {
+                        text = (text ? text + '\\n\\n' : '')
+                            + attachments.join('\\n');
+                    }
                     if (text && text.length > 10) {
                         messages.push({
                             index: i * 2,
@@ -480,7 +649,7 @@ def _extract_messages_gemini(page):
 
                 const modelEl = turn.querySelector('response-container message-content');
                 if (modelEl) {
-                    const text = (modelEl.innerText || '').trim();
+                    const text = toMarkdown(modelEl);
                     if (text && text.length > 10) {
                         messages.push({
                             index: i * 2 + 1,
@@ -541,20 +710,58 @@ def _extract_messages_chatgpt(page):
 
 
 def _extract_artifacts(page):
-    """Extract code artifacts from the page."""
+    """Extract code artifacts from the page.
+
+    Fence language detection, in order:
+      1. a 'language-<name>' class token on the <code> element
+         (Claude, ChatGPT, most highlighters);
+      2. Gemini's <code-block> header label — a bare text span
+         ("Bash", "Python") outside the <pre>;
+      3. 'text'.
+    The result is validated against a conservative charset so the
+    markdown fence never inherits framework class soup like
+    'code-container formatted ng-tns-c...'.
+    """
     return page.evaluate("""
         () => {
             const codeBlocks = document.querySelectorAll('pre code');
             const artifacts = [];
 
+            const validLang = (s) => {
+                s = (s || '').trim().toLowerCase().replace(/\\s+/g, '');
+                return /^[a-z0-9_+#.-]{1,20}$/.test(s) ? s : null;
+            };
+
             codeBlocks.forEach((block, i) => {
                 const code = block.textContent;
                 if (code && code.length > 50) {
-                    const language = block.className.replace('language-', '') || 'text';
+                    let language = null;
+                    const m = (block.className || '').toString()
+                        .match(/language-([A-Za-z0-9_+#.-]{1,20})/);
+                    if (m) language = validLang(m[1]);
+                    if (!language) {
+                        const cb = block.closest('code-block');
+                        if (cb) {
+                            const walker = document.createTreeWalker(
+                                cb, NodeFilter.SHOW_ELEMENT);
+                            let el;
+                            while ((el = walker.nextNode())) {
+                                if (el.closest('pre')) continue;
+                                const own = [...el.childNodes]
+                                    .filter(n => n.nodeType === 3)
+                                    .map(n => n.textContent.trim())
+                                    .join('');
+                                if (own) {
+                                    language = validLang(own);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     artifacts.push({
                         index: i,
                         content: code,
-                        language: language
+                        language: language || 'text'
                     });
                 }
             });
@@ -564,26 +771,40 @@ def _extract_artifacts(page):
     """)
 
 
+# url_prefixes is a tuple because one provider can own several share
+# domains: Gemini's in-app "Copy link" now hands out short links on
+# share.gemini.google that 302-redirect to gemini.google.com/share/<id>.
+# Both must route to the Gemini extractor — an unrecognized prefix
+# silently falls back to the Claude extractor, which finds none of
+# Gemini's DOM and returns 0 messages.
 PROVIDERS = {
     "claude": {
-        "url_prefix": "https://claude.ai/share/",
+        "url_prefixes": ("https://claude.ai/share/",),
         "extract_messages": _extract_messages_claude,
         "extract_metadata": _extract_chat_metadata_claude,
         "label": "Claude",
     },
     "gemini": {
-        "url_prefix": "https://gemini.google.com/share/",
+        "url_prefixes": (
+            "https://gemini.google.com/share/",
+            "https://share.gemini.google/",
+        ),
         "extract_messages": _extract_messages_gemini,
         "extract_metadata": _extract_chat_metadata_gemini,
         "label": "Gemini",
     },
     "chatgpt": {
-        "url_prefix": "https://chatgpt.com/share/",
+        "url_prefixes": ("https://chatgpt.com/share/",),
         "extract_messages": _extract_messages_chatgpt,
         "extract_metadata": _extract_chat_metadata_chatgpt,
         "label": "ChatGPT",
     },
 }
+
+
+def _url_matches_provider(url, cfg):
+    """True if the URL starts with any of the provider's share prefixes."""
+    return any(url.startswith(p) for p in cfg["url_prefixes"])
 
 
 def _build_markdown(url, messages, artifacts, assistant_label='Claude'):
@@ -827,8 +1048,10 @@ Examples:
 
     parser.add_argument(
         'url',
-        help=('Share URL (Claude: https://claude.ai/share/... '
-              'or Gemini: https://gemini.google.com/share/...)')
+        help=('Share URL (Claude: https://claude.ai/share/..., '
+              'Gemini: https://gemini.google.com/share/... or '
+              'https://share.gemini.google/..., '
+              'ChatGPT: https://chatgpt.com/share/...)')
     )
 
     parser.add_argument(
@@ -898,7 +1121,7 @@ Examples:
         args.provider = next(
             (
                 name for name, cfg in PROVIDERS.items()
-                if args.url.startswith(cfg["url_prefix"])
+                if _url_matches_provider(args.url, cfg)
             ),
             'claude',
         )
@@ -931,7 +1154,7 @@ Examples:
         args.url, fallback=registry_label
     )
     recognized = any(
-        args.url.startswith(cfg["url_prefix"])
+        _url_matches_provider(args.url, cfg)
         for cfg in PROVIDERS.values()
     )
     if not recognized:
@@ -939,7 +1162,8 @@ Examples:
               "share-link pattern")
         print("   Recognized:")
         for cfg in PROVIDERS.values():
-            print(f"     {cfg['url_prefix']}...")
+            for prefix in cfg["url_prefixes"]:
+                print(f"     {prefix}...")
         print(f"   Got: {args.url}")
         response = input("   Continue anyway? (y/N): ")
         if response.lower() != 'y':
