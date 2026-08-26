@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-chat-extractor"
-version = "1.7.0"
-description = "Extract and consolidate shared Claude, Gemini, and ChatGPT conversations"
+version = "1.8.0"
+description = "Extract and consolidate shared Claude, Gemini, ChatGPT, and Google AI Mode conversations"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}

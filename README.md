@@ -26,7 +26,7 @@ claude-chat-extractor https://claude.ai/share/CHAT_ID
 
 Your 200k token conversation becomes ~50k tokens (75% reduction) while preserving all content and code artifacts.
 
-**Note:** This tool extracts from Claude shared chat URLs and is designed for continuing conversations in Claude Desktop. Gemini share URLs (`gemini.google.com/share/...` and the short-link form `share.gemini.google/...`) are also supported — see [Gemini support](#gemini-support-experimental) below.
+**Note:** This tool extracts from Claude shared chat URLs and is designed for continuing conversations in Claude Desktop. Gemini share URLs (`gemini.google.com/share/...` and the short-link form `share.gemini.google/...`) are also supported — see [Gemini support](#gemini-support-experimental) below. ChatGPT (`chatgpt.com/share/...`) and Google AI Mode (`share.google/aimode/...`) are supported too — see [Google AI Mode support](#google-ai-mode-support-experimental).
 
 ## Why Patchright? (Cloudflare Bot Detection)
 
@@ -74,8 +74,8 @@ claude-chat-extractor --version
 Prints the installed version and description, for example:
 
 ```text
-claude-chat-extractor 1.2.0
-Extract and consolidate shared Claude and Gemini conversations
+claude-chat-extractor 1.8.0
+Extract and consolidate shared Claude, Gemini, ChatGPT, and Google AI Mode conversations
 ```
 
 This is the fastest way to confirm an upgrade landed, or to report what you're running when filing a bug.
@@ -174,6 +174,25 @@ The output format is identical for both providers — the assistant's role label
 
 **Why "experimental":** Gemini's share pages are Angular-based with custom elements (`<share-turn-viewer>`, `<user-query-content>`, `<message-content>`) and no public selector contract. Google may rev the DOM in future builds and silently break extraction. If a Gemini run returns 0 messages, file an issue — the fix is a selector update in the `PROVIDERS` registry in [src/claude_chat_extractor/extractor.py](src/claude_chat_extractor/extractor.py).
 
+## Google AI Mode support (experimental)
+
+Google AI Mode conversations shared with the in-app "Share" button produce `https://share.google/aimode/<id>` links. Those are supported as of v1.8.0 and auto-detected from the hostname:
+
+```bash
+claude-chat-extractor https://share.google/aimode/zqeu8h16N68vKvVTe
+```
+
+**This one is structurally different from the other three providers.** A `share.google/aimode/...` link 302-redirects to an ordinary `https://www.google.com/search?...&udm=50` results page — there is no dedicated share DOM. The extractor reads the turn structure from two markers that alternate in document order: the a11y heading `<h2>You said: <query></h2>` for each user turn, and `<div data-subtree="aimc">` ("AI Mode content") for each answer.
+
+Two consequences worth knowing:
+
+- **Only the `share.google/aimode/` form is auto-detected.** If you paste the post-redirect `google.com/search?...` URL instead, the mode lives in a query parameter (`udm=50`) that prefix matching cannot see, so pass `--provider aimode` explicitly.
+- **No chat date exists anywhere on the page,** so the filename date falls back to the day you ran the tool (same as Claude).
+
+Answers are serialized DOM → markdown, so tables, nested lists, bold/italic, links and section headings survive. AI Mode marks its section titles as ARIA headings (`<div role="heading" aria-level="3">`) rather than `<h3>`, and those become real markdown headings. Three pieces of live UI are stripped rather than transcribed: the inline citation chips ("Related results" buttons and their icon-only links), the per-answer share widget (`role="dialog"` with its "Share public link" heading and copy box), and the collapsed feedback panel (rating chips plus the Google privacy blurb). The sources carousel at the end of an answer is also dropped — it lives in the page's `rhs-col` container and its cards carry only truncated snippets.
+
+**Why "experimental":** every CSS class on a Google search page is an obfuscated build artifact that rotates without notice, so the skip rules here are deliberately semantic (tag name, `role`, `aria-hidden`, computed visibility) rather than class-based. Even so, Google can rename `data-subtree="aimc"` or restructure the turn markers at any time. If a run returns 0 messages, the fix is in `_extract_messages_aimode` in [src/claude_chat_extractor/extractor.py](src/claude_chat_extractor/extractor.py).
+
 ## How to Continue a Conversation
 
 1. **Share your chat** - Click share button in Claude Desktop
@@ -221,6 +240,7 @@ https://claude.ai/share/...          →  claude
 https://chatgpt.com/share/...        →  chatgpt
 https://gemini.google.com/share/..   →  gemini
 https://share.gemini.google/...      →  gemini
+https://share.google/aimode/...      →  google
 ```
 
 This decouples the filename from internal extractor selection — pointing the tool at a `chatgpt.com` URL produces a `chatgpt`-prefixed file even when the actual extraction is handled by a fallback strategy.
@@ -229,6 +249,7 @@ This decouples the filename from internal extractor selection — pointing the t
 
 - **Gemini** — uses the "Created with Pro April 8, 2026 at 07:24 PM" line from the share page header. This is the **actual chat-creation date.**
 - **ChatGPT** — decodes the Unix timestamp from the first 8 hex chars of the share URL (UUID v8 format). This is the **share-creation moment**, ≈ chat-end time for short chats.
+- **Google AI Mode** — the shared search page carries no chat date at all, so the date falls back to **today** (when you ran the tool).
 - **Claude** — Anthropic strips chat dates from share pages (verified across multiple URLs), so the date falls back to **today** (when you ran the tool). Filenames will still be unique because the chat title differs, but the date won't reflect when the conversation actually happened.
 - The filename is sanitized for **NTFS / Microsoft Windows**: invalid characters (`< > : " / \ | ? *`) become underscores, runs of underscores collapse to one, reserved device names (`CON`, `PRN`, `COM1`, …) get a leading underscore added, length is capped at 80 chars for the title slug.
 
@@ -250,7 +271,7 @@ Whatever string you pass is run through the same Windows-safe sanitizer as auto-
 
 ```text
 positional:
-  url                      Share URL (Claude or Gemini)
+  url                      Share URL (Claude, Gemini, ChatGPT, or Google AI Mode)
 
 optional:
   -V, --version            Print installed version and description, then exit
@@ -261,7 +282,7 @@ optional:
                            (only created when needed)
   --keep-artifacts         Save individual artifact files to work dir
   --keep-html              Save intermediate HTML to work dir
-  --provider {claude,gemini,chatgpt}
+  --provider {claude,gemini,chatgpt,aimode}
                            AI provider (auto-detected from URL hostname)
   --slug TEXT              Override the title portion of the auto-generated
                            filename (sanitized for Windows). Ignored if -o is given.

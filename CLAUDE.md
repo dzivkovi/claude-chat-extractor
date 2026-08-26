@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Claude Chat Extractor is a Python CLI tool that extracts conversations from shared chat URLs using Playwright browser automation. It consolidates the conversation and code artifacts into a single markdown file, optimized for LLM consumption with ~75% token reduction.
 
-Primary target is Claude (`https://claude.ai/share/...`). As of v1.2.0 it also supports Gemini (`https://gemini.google.com/share/...`, plus the `https://share.gemini.google/...` short-link form since v1.7.0) via a second provider entry — see the `PROVIDERS` registry in [extractor.py](src/claude_chat_extractor/extractor.py).
+Primary target is Claude (`https://claude.ai/share/...`). As of v1.2.0 it also supports Gemini (`https://gemini.google.com/share/...`, plus the `https://share.gemini.google/...` short-link form since v1.7.0), ChatGPT (`https://chatgpt.com/share/...`, v1.6.0), and Google AI Mode (`https://share.google/aimode/...`, v1.8.0) via additional provider entries — see the `PROVIDERS` registry in [extractor.py](src/claude_chat_extractor/extractor.py).
 
 **Key Use Case**: Continue Claude Desktop conversations beyond the 200k token limit by extracting chat history to markdown and uploading to a new session.
 
@@ -57,7 +57,7 @@ src/claude_chat_extractor/
 
 ### Core Components ([extractor.py](src/claude_chat_extractor/extractor.py))
 
-**`PROVIDERS` registry** — module-level dict mapping provider key (`'claude'`, `'gemini'`, `'chatgpt'`) to a config with `url_prefixes` (a tuple — one provider can own several share domains, e.g. Gemini's `gemini.google.com/share/` plus the `share.gemini.google/` short links), `extract_messages` callable, and display `label`. This is the extension point for new providers: add one entry with the right URL prefixes and a `_extract_messages_<provider>` function. A URL matching no registered prefix falls back to the Claude extractor — which finds nothing on foreign DOMs and yields 0 messages, so keep prefixes current.
+**`PROVIDERS` registry** — module-level dict mapping provider key (`'claude'`, `'gemini'`, `'chatgpt'`, `'aimode'`) to a config with `url_prefixes` (a tuple — one provider can own several share domains, e.g. Gemini's `gemini.google.com/share/` plus the `share.gemini.google/` short links), `extract_messages` callable, and display `label`. This is the extension point for new providers: add one entry with the right URL prefixes and a `_extract_messages_<provider>` function. A URL matching no registered prefix falls back to the Claude extractor — which finds nothing on foreign DOMs and yields 0 messages, so keep prefixes current.
 
 **`fetch_chat(url, format_type, work_dir, keep_html, provider='claude')`**
 
@@ -75,6 +75,8 @@ src/claude_chat_extractor/
 - **Claude** (`_extract_messages_claude`): iterates a flat list of `[data-test-render-count]` containers and detects role per element via `.font-user-message` / `className.includes('user')`.
 - **Gemini** (`_extract_messages_gemini`): iterates `<share-turn-viewer>` custom elements, each containing one `<user-query-content>` (user side) and one `<response-container> message-content` (model side). Strips the leading `"You said"` accessibility-label prefix from `user-query-content.innerText`. Since v1.7.0 the model side is serialized DOM→markdown (headings, lists, blockquotes, tables, links, inline code, `<code-block>` fences with their language label) instead of read via `innerText`, with Gemini UI decoration (`sources-carousel-inline`, `source-footnote`, `follow-up`, buttons, icons) skipped; user-side `<user-query-file-preview>` attachments are appended to the user message as `[Attachment: <name>]` / `[Attached image: <url>]` manifest lines (share pages never expose attachment contents).
 
+- **Google AI Mode** (`_extract_messages_aimode`): the share link 302-redirects to a plain `google.com/search?...&udm=50` page, so there is no share DOM at all. Turns are read from two markers alternating in document order: `<h2>You said: <query></h2>` (user) and `<div data-subtree="aimc">` (assistant). The answer is serialized DOM→markdown from the `[data-container-id="main-col"]` sub-container, which excludes the `rhs-col` sources carousel. Skip rules are semantic, never class-based (Google's classes are rotating build artifacts): `role="dialog"` (the per-answer share widget), `aria-hidden="true"`, computed `display:none`/`visibility:hidden` (the collapsed feedback panel and "Show all" toggles), plus tag names (button, svg, textarea, aside, img). AI Mode's section titles are ARIA headings (`<div role="heading" aria-level="3">`), promoted to markdown headings. `<span data-subtree="aimfl">` must NOT be skipped — despite looking like a wrapper it holds the answer's real first line. Metadata: the `<h1>` reads "AI Mode Conversation: <first query>" and the prefix is stripped; no chat date exists on the page, so the filename date falls back to today.
+
 **`consolidate_markdown(url, messages, artifacts, output_file, assistant_label='Claude')`**
 
 - Builds a single markdown file with metadata header, artifact TOC, conversation text with role labels (`👤 User` / `🤖 {assistant_label}`), and embedded artifact code blocks
@@ -82,7 +84,7 @@ src/claude_chat_extractor/
 
 **`main()`**
 
-- CLI entry point with argparse; adds `--provider {claude,gemini}` flag
+- CLI entry point with argparse; adds `--provider {claude,gemini,chatgpt,aimode}` flag
 - Auto-detects provider from URL hostname when `--provider` is omitted (falls back to `claude` if no prefix matches)
 - URL validation uses the selected provider's `url_prefix` — warns but does not block
 - Orchestrates: fetch → consolidate (for markdown) or fetch → move PDF

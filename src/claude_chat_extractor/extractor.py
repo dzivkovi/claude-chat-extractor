@@ -35,10 +35,10 @@ try:
     __version__ = _pkg_meta["Version"]
     __description__ = _pkg_meta["Summary"]
 except (ImportError, PackageNotFoundError):
-    __version__ = "1.7.0"
+    __version__ = "1.8.0"
     __description__ = (
-        "Extract and consolidate shared Claude, Gemini, "
-        "and ChatGPT conversations"
+        "Extract and consolidate shared Claude, Gemini, ChatGPT, "
+        "and Google AI Mode conversations"
     )
 
 
@@ -184,6 +184,10 @@ _PROVIDER_DISPLAY_LABELS = {
     'claude': 'Claude',
     'chatgpt': 'ChatGPT',
     'gemini': 'Gemini',
+    # share.google/aimode/... -> hostname label 'google'. Gemini share
+    # links keep their own 'gemini' label (share.gemini.google strips
+    # only the leading 'share'), so this entry is AI Mode's alone.
+    'google': 'Google AI Mode',
 }
 
 
@@ -771,6 +775,233 @@ def _extract_artifacts(page):
     """)
 
 
+def _extract_messages_aimode(page):
+    """Extract conversation messages from a Google AI Mode share page.
+
+    A share.google/aimode/<id> link 302-redirects to a normal
+    google.com/search?...&udm=50 result page, so there is no bespoke
+    share DOM the way Claude/Gemini/ChatGPT have one. The turn
+    structure is carried by two markers that alternate in document
+    order, one pair per exchange:
+
+      - user turn:      <h2> whose text is "You said: <query>"
+                        (an a11y heading; the "You said: " prefix is
+                        stripped the same way Gemini's is)
+      - assistant turn: <div data-subtree="aimc">  ("AI Mode content")
+
+    Responses are serialized DOM -> markdown rather than read via
+    innerText: AI Mode answers carry real <table>, <ul>/<li>, <strong>
+    and <a> markup that innerText flattens, and they embed live UI that
+    innerText would leak into the transcript - inline citation chips
+    (a <button aria-label="Related results"> plus icon-only <a> links),
+    and a per-answer share widget (a role="dialog" subtree with a
+    "Share public link" heading, a copy <textarea>, and an <aside>
+    reading "Cannot copy the link right now").
+
+    The skip rules are deliberately semantic (tag name, role=dialog,
+    aria-hidden) rather than class-based: every class on this page is
+    an obfuscated Google build artifact ("n6owBd awi2gc") that rotates
+    without notice.
+
+    Note <span data-subtree="aimfl"> is NOT skipped - despite looking
+    like a wrapper it holds the answer's real first line.
+    """
+    return page.evaluate("""
+        () => {
+            const SKIP_TAGS = new Set([
+                'button', 'svg', 'path', 'textarea', 'input', 'select',
+                'form', 'aside', 'style', 'script', 'noscript', 'img',
+                'g-dialog', 'g-dialog-content', 'template',
+            ]);
+
+            const skipEl = (el) => {
+                const tag = el.tagName.toLowerCase();
+                if (SKIP_TAGS.has(tag)) return true;
+                // The per-answer share widget and any other overlay.
+                if (el.getAttribute('role') === 'dialog') return true;
+                if (el.getAttribute('aria-hidden') === 'true') return true;
+                // Collapsed UI that a DOM walk sees but a reader never
+                // does: the thumbs-up/down feedback panel with its rating
+                // chips and privacy blurb, and "Show all" toggles. Tested
+                // per-element rather than via checkVisibility() because
+                // Chrome reports display:contents elements as invisible,
+                // and Google wraps real answer content in those.
+                const cs = getComputedStyle(el);
+                if (cs.display === 'none' || cs.visibility === 'hidden') {
+                    return true;
+                }
+                return false;
+            };
+
+            const tableToMd = (tbl) => {
+                const rows = [...tbl.querySelectorAll('tr')].map(tr =>
+                    [...tr.querySelectorAll('th,td')].map(c =>
+                        (c.innerText || '').trim()
+                            .replace(/\\|/g, '\\\\|')
+                            .replace(/\\n+/g, ' ')
+                    )
+                );
+                if (!rows.length) return '';
+                const lines = [
+                    '| ' + rows[0].join(' | ') + ' |',
+                    '| ' + rows[0].map(() => '---').join(' | ') + ' |',
+                ];
+                rows.slice(1).forEach(r => lines.push('| ' + r.join(' | ') + ' |'));
+                return '\\n' + lines.join('\\n') + '\\n';
+            };
+
+            function serializeChildren(node, ctx) {
+                return [...node.childNodes].map(n => serialize(n, ctx)).join('');
+            }
+
+            function serialize(node, ctx) {
+                if (node.nodeType === 3) {
+                    return node.textContent.replace(/\\s+/g, ' ');
+                }
+                if (node.nodeType !== 1) return '';
+                if (skipEl(node)) return '';
+                const tag = node.tagName.toLowerCase();
+                if (tag === 'table') return tableToMd(node);
+                if (tag === 'br') return '\\n';
+                if (tag === 'hr') return '\\n---\\n';
+
+                const kids = () => serializeChildren(node, ctx);
+
+                if (/^h[1-6]$/.test(tag)) {
+                    const t = kids().trim();
+                    if (!t) return '';
+                    return '\\n' + '#'.repeat(parseInt(tag[1], 10)) + ' ' + t + '\\n';
+                }
+                // AI Mode's section titles are ARIA headings, not <h*>:
+                // <div role="heading" aria-level="3">. Without this they
+                // land in the transcript as bare paragraphs.
+                if (node.getAttribute('role') === 'heading') {
+                    const t = kids().trim();
+                    if (!t) return '';
+                    const lvl = Math.min(6, Math.max(1,
+                        parseInt(node.getAttribute('aria-level'), 10) || 3));
+                    return '\\n' + '#'.repeat(lvl) + ' ' + t + '\\n';
+                }
+                if (tag === 'p') return '\\n' + kids().trim() + '\\n';
+                if (tag === 'blockquote') {
+                    const inner = kids().trim().split('\\n')
+                        .map(l => '> ' + l).join('\\n');
+                    return '\\n' + inner + '\\n';
+                }
+                if (tag === 'ul' || tag === 'ol') {
+                    const items = [...node.children]
+                        .filter(c => c.tagName.toLowerCase() === 'li');
+                    const indent = '  '.repeat(ctx.listDepth);
+                    const lines = items.map((li, idx) => {
+                        const marker = tag === 'ol' ? `${idx + 1}. ` : '- ';
+                        return serializeChildren(li, {listDepth: ctx.listDepth + 1})
+                            .trim().split('\\n')
+                            .map((l, j) => j === 0
+                                ? indent + marker + l
+                                : indent + '  ' + l)
+                            .join('\\n');
+                    });
+                    return '\\n' + lines.join('\\n') + '\\n';
+                }
+                if (tag === 'pre') {
+                    return '\\n```\\n'
+                        + (node.textContent || '').replace(/\\n+$/, '')
+                        + '\\n```\\n';
+                }
+                if (tag === 'code') {
+                    const t = (node.textContent || '').trim();
+                    return t ? '`' + t + '`' : '';
+                }
+                if (tag === 'a') {
+                    const href = node.getAttribute('href') || '';
+                    const t = kids().trim();
+                    // Icon-only citation links have no text - drop them.
+                    if (!t) return '';
+                    return href.startsWith('http') ? `[${t}](${href})` : t;
+                }
+                if (tag === 'b' || tag === 'strong') {
+                    const t = kids().trim();
+                    return t ? `**${t}**` : '';
+                }
+                if (tag === 'i' || tag === 'em') {
+                    const t = kids().trim();
+                    return t ? `*${t}*` : '';
+                }
+                // AI Mode has no <p>: paragraphs are bare text runs inside
+                // nested <div>s, so block-level containers must force a
+                // break or the whole answer collapses into one line.
+                if (tag === 'div' || tag === 'section' || tag === 'article') {
+                    const t = kids();
+                    return t.trim() ? '\\n' + t.trim() + '\\n' : '';
+                }
+                return kids();
+            }
+
+            const toMarkdown = (root) =>
+                serializeChildren(root, {listDepth: 0})
+                    .replace(/\\u00a0/g, ' ')
+                    .replace(/[ \\t]+\\n/g, '\\n')
+                    .replace(/\\n{3,}/g, '\\n\\n')
+                    .replace(/(\\s*---)+\\s*$/, '')
+                    .trim();
+
+            const messages = [];
+            // h2 (user) and [data-subtree=aimc] (assistant) alternate in
+            // document order; reading them together preserves the turn
+            // sequence without relying on a per-turn wrapper element.
+            const nodes = document.querySelectorAll('h2, [data-subtree="aimc"]');
+
+            nodes.forEach((el, i) => {
+                if (el.tagName === 'H2') {
+                    const raw = (el.innerText || '').trim();
+                    const m = raw.match(/^You said:\\s*([\\s\\S]+)$/);
+                    if (!m) return;
+                    const text = m[1].trim();
+                    if (text.length > 10) {
+                        messages.push({index: i, role: 'user', content: text});
+                    }
+                } else {
+                    // The answer lives in the "main-col" container; the
+                    // sibling "rhs-col" holds the sources carousel (cards
+                    // of truncated snippets), which is UI, not transcript.
+                    const root =
+                        el.querySelector('[data-container-id="main-col"]') || el;
+                    const text = toMarkdown(root);
+                    if (text.length > 10) {
+                        messages.push({index: i, role: 'assistant', content: text});
+                    }
+                }
+            });
+
+            return messages;
+        }
+    """)
+
+
+def _extract_chat_metadata_aimode(page):
+    """Extract the chat title from a Google AI Mode share page.
+
+    Google stamps the shared conversation's <h1> as
+    "AI Mode Conversation: <first query>". The wrapper prefix is
+    stripped so the filename slug is the query itself - the provider
+    is already carried by the "google" label in the filename. There is
+    no chat-creation date anywhere on the page, so created_date stays
+    None and the filename falls back to today's date.
+    """
+    return page.evaluate("""
+        () => {
+            const h1 = document.querySelector('h1');
+            let title = h1 ? (h1.innerText || '').trim() : '';
+            if (!title) {
+                title = (document.title || '')
+                    .replace(/\\s*-\\s*Google Search\\s*$/, '').trim();
+            }
+            title = title.replace(/^AI Mode Conversation:\\s*/i, '').trim();
+            return {title: title, createdRaw: null};
+        }
+    """)
+
+
 # url_prefixes is a tuple because one provider can own several share
 # domains: Gemini's in-app "Copy link" now hands out short links on
 # share.gemini.google that 302-redirect to gemini.google.com/share/<id>.
@@ -798,6 +1029,16 @@ PROVIDERS = {
         "extract_messages": _extract_messages_chatgpt,
         "extract_metadata": _extract_chat_metadata_chatgpt,
         "label": "ChatGPT",
+    },
+    # Google AI Mode. The share link 302-redirects to a plain
+    # google.com/search?...&udm=50 page, so only the share.google form
+    # is prefix-matchable — a pasted post-redirect search URL carries
+    # its mode in a query param and must use --provider aimode.
+    "aimode": {
+        "url_prefixes": ("https://share.google/aimode/",),
+        "extract_messages": _extract_messages_aimode,
+        "extract_metadata": _extract_chat_metadata_aimode,
+        "label": "Google AI Mode",
     },
 }
 
